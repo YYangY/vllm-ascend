@@ -1,0 +1,60 @@
+@startuml reuse_process
+participant "P 模型 / NPU stream" as P
+participant "MultiConnector" as Multi
+participant "P layerwise sender" as Send
+participant "Store 保存 / 接收线程" as Store
+database "Mooncake Store" as Pool
+participant "D scheduler / 接收控制" as D
+participant "D manager / attention" as Runtime
+
+D -> Runtime : 分配 Main Host 与 Indexer HBM，注册内存
+Runtime --> D : 目标布局、容量、注册代次
+D -> Send : 提前发布请求目标及 block IDs
+Send --> D : 校验布局与请求实例，接收目标成功
+note over P, D
+D 不等待完整 P 结果才发布地址；资源不足时先背压。
+目标就绪后才能进入会复用源槽位的 P 执行。
+end note
+loop 当前 chunk 的每个逻辑层 L
+ P -> Multi : KV-ready / save hook
+ Multi -> Send : 同步登记源槽位当前代 pending
+ Multi -> Store : 发布 L 的保存任务
+ par attention 读取
+  P -> P : 完成 L 的计算读取事件
+ else Store 保存
+  Store -> Pool : L 的 range PUT
+  Pool --> Store : 本层源读取完成，或失败
+ else P/D 分腿传输
+  Send -> Runtime : Indexer D2D，同步完成语义
+  Runtime --> Send : Indexer 完成或失败
+  Send -> Runtime : Main D2RH，同步完成语义
+  Runtime --> Send : Main 完成或失败
+  Send -> Send : 汇总该代所有源读取；终结 pending
+  Send -> D : 组件 / 层 / chunk 结果（可合并通知）
+ end
+ Store -> Store : 下一占用者等待计算和 Store 源读取
+ Store -> Multi : external slot waiter(下一层)
+ Multi -> Send : wait_for_layer_reuse
+ Send --> Store : 经 Multi 返回成功或错误
+ alt 失败
+  Store --> P : 禁止覆盖，失败退出；保留仍被读取的内存
+ else 成功
+  opt 需要历史 KV
+   Store -> Pool : GET 下一层的已提交快照
+   Pool --> Store : 确认加载成功，失败则禁止继续
+  end
+  Store --> P : 允许下一层写入共享槽位
+ end
+end
+Store -> Pool : 最后相关层结束后提交本 chunk 快照
+note over Store, Pool
+整对象提交不阻塞本 chunk 内的槽位轮换。
+end note
+D -> D : 汇总请求全部范围、组件、层及所需 rank
+alt 所有必要数据成功就绪
+ D -> Runtime : 允许 decode
+ Runtime -> Runtime : Indexer 选取 / Host 稀疏访问 / 新 KV 写回
+else 缺失或失败
+ D -> D : 不发布成功，不在缺 Main HBM 时重算
+end
+@enduml

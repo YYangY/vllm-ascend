@@ -1,0 +1,35 @@
+@startuml reuse_development
+skinparam componentStyle rectangle
+package "A：先 P 复用，再共同接入 D 运行时" {
+ component "ascend_store/\nlayout / scheduler / metadata\nworker / kv_transfer / session_tracker" as Store <<扩展-A>>
+ component "worker/model_runner_v1.py\nHost 分配入口" as Runner <<适配-A>>
+ component "sparse_kv_offload/\nmanager / mooncake_host_pool" as Manager <<参考分支适配-A>>
+ component "attention/sfa_kv_offload.py\n现有 fused op 依赖" as Attn <<参考分支适配-A>>
+}
+package "B：先独立 connector，再共同接线" {
+ component "mooncake_layerwise_connector.py\nDSA 目标布局与完成汇总" as PD <<扩展-B>>
+ component "ascend_multi_connector.py" as Multi <<扩展-B>>
+ component "mooncake_dsa_metadata.py\nmooncake_dsa_transfer.py\n提取可复用布局与校验" as Helpers <<参考分支适配-B>>
+ component "已有请求转发 / rendezvous\nD 提前分配并发布地址" as Route <<适配-B>>
+}
+package "参考实现，不整体替换基线" {
+ component "GitCode：layerwise_to_dram\n逐层 push / 分腿 / DONE / reuse waiter" as Old
+ component "mazifan：MooncakeConnectorV1\nHost Main + HBM Indexer / 结果汇总" as New
+}
+Runner --> Manager : Host allocation callback
+Attn --> Manager : Host views / onload / writeback
+PD --> Helpers : 组件布局、范围与边界校验
+PD --> Manager : 经明确接口取目标视图
+Route --> PD : request instance / target metadata
+Multi --> Store : 注册 waiter
+Multi --> PD : 完成等待及 hooks
+Old ..> PD : 迁移逐层语义，不复制运行时方法替换
+New ..> Helpers : 复用布局与错误契约
+New ..> Manager : 依赖审计及适配
+note bottom of Multi
+M0：共同约定接口。
+M1：A 做 buffer reuse；B 做 connector 与测试目标传输。
+M2：一起接 D runtime、真实视图和 MultiConnector。
+M3：完整链路联合验收。
+end note
+@enduml

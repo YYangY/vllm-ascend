@@ -1,0 +1,45 @@
+@startuml reuse_scenario
+start
+:D scheduler 分配并保留目标 blocks;
+:manager 绑定 Main Host 与 Indexer HBM 物理池视图;
+:完成注册，提前发布目标、backing 身份和 writer_plan;
+if (目标兼容且资源可用?) then (否)
+ :背压或显式失败，不开始复用源槽位;
+ stop
+endif
+:确定 chunk 范围与已提交历史快照;
+if (所需历史范围可恢复?) then (否)
+ :显式失败，不读取失效槽位;
+ stop
+endif
+repeat
+ :等待旧占用者的计算、Store、P/D 源读取结束;
+ :推进 SlotEpoch 并打开读者登记窗口;
+ :恢复当前层所需历史 KV，确认加载成功;
+ :按需计算，登记全部传输 ticket 并封口;
+ :发布 Store 保存；无计算 hook 仍编排恢复后发送;
+ :向 D 逐层传输本次所需范围;
+ :Indexer 按消费 rank D2D；Main 按唯一 writer D2RH;
+ if (本代已封口且全部必要源读取成功结束?) then (否)
+  :两端标记失败；隔离仍在途的源与目标内存;
+  stop
+ endif
+ :释放源槽位读取依赖，记录 D 的范围完成状态;
+repeat while (还有层或传输范围?) is (是)
+:最后相关层保存完成后提交本 chunk Store 快照;
+if (提交成功?) then (否)
+ :不发布失败快照，终结受影响执行;
+ stop
+endif
+if (还有 prefill chunk?) then (是)
+ :保存已提交版本，继续下一 chunk；D 暂不开始 decode;
+else (否)
+ if (每 backing Main 并集、各 rank Indexer 和全部 terminal 均就绪?) then (是)
+  :校验 ReceiveReceipt 并接入可见性依赖;
+  :允许 decode；稀疏访问 Host Main 并写回新 KV;
+ else (否)
+  :等待未完成传输，超时或错误则失败;
+ endif
+endif
+stop
+@enduml

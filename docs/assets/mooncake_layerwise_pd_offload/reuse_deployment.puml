@@ -1,0 +1,39 @@
+@startuml reuse_deployment
+node "P 实例（每个 TP rank）" {
+ artifact "runner / MultiConnector\nStore threads / layerwise sender" as PWorker
+ database "NPU HBM\n共享 Main 槽位 / 独立层\nIndexer 初版保持独立分配" as PHBM
+}
+node "P EngineCore" {
+ artifact "KVPoolScheduler\n请求 / 快照 metadata" as PScheduler
+}
+node "Mooncake Store 服务" {
+ database "可跨请求复用的历史对象\nrange sessions" as Pool
+}
+node "D 实例（相同 TP）" {
+ artifact "D EngineCore\n目标分配调度 / 请求完成汇总" as DScheduler
+ artifact "worker / connector\nSparseKVOffloadManager" as DWorker
+ database "CPU Host KV pool\nMain KV / 请求生命周期" as Host
+ node "Ascend NPU" {
+  database "HBM Indexer\nselection / resident buffer" as Indexer
+  artifact "SFA offload attention" as Compute
+ }
+}
+PScheduler --> PWorker : 已有调度通信
+PWorker --> PHBM : 计算及覆盖前同步
+PHBM --> Pool : 保存
+Pool --> PHBM : 恢复
+DScheduler --> DWorker : 分配请求目标
+DWorker ..> PWorker : 发布注册区域 / block IDs
+PHBM --> Indexer : 逐层 Indexer D2D
+PHBM --> Host : 逐层 Main D2RH
+PWorker --> DScheduler : 传输完成 / 失败
+DWorker --> Host : 分配、注册、清理
+DWorker --> Indexer : 注册、缓存维护
+DScheduler --> Compute : 请求数据全部就绪后放行
+Compute --> Host : 稀疏读取及新 token 写回
+Compute --> Indexer : 选择与计算
+note bottom of Host
+Host pool 不等同于 Mooncake Store 对象池。
+共享 Host 区域按实际分配去重计量，不能按 TP 重复相加。
+end note
+@enduml

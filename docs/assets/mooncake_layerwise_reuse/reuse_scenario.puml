@@ -1,0 +1,42 @@
+@startuml reuse_scenario
+start
+:选择普通 D HBM 模式或 DSA Host 模式;
+:DSA 模式分配 Main Host 与 Indexer HBM;
+:完成注册，提前发布请求目标与布局;
+if (目标兼容且资源可用?) then (否)
+ :背压或显式失败，不开始复用源槽位;
+ stop
+endif
+:确定 chunk 范围与已提交历史快照;
+if (所需历史范围可恢复?) then (否)
+ :显式失败，不读取失效槽位;
+ stop
+endif
+repeat
+ :等待旧占用者的计算、Store、P/D 源读取结束;
+ :恢复当前层所需历史 KV，确认加载成功;
+ :计算当前层，先登记 pending，再发布 Store 保存;
+ :向 D 逐层传输本次所需范围;
+ :DSA 为 Indexer D2D 和 Main D2RH 两腿;
+ if (全部必要源读取成功结束?) then (否)
+  :两端标记失败；隔离仍在途的源与目标内存;
+  stop
+ endif
+ :释放源槽位读取依赖，记录 D 的范围完成状态;
+repeat while (还有层或传输范围?) is (是)
+:最后相关层保存完成后提交本 chunk Store 快照;
+if (提交成功?) then (否)
+ :不发布失败快照，终结受影响执行;
+ stop
+endif
+if (还有 prefill chunk?) then (是)
+ :保存已提交版本，继续下一 chunk；D 暂不开始 decode;
+else (否)
+ if (D 的所有范围、组件、层和所需 rank 均就绪?) then (是)
+  :允许 decode；稀疏访问 Host Main 并写回新 KV;
+ else (否)
+  :等待未完成传输，超时或错误则失败;
+ endif
+endif
+stop
+@enduml

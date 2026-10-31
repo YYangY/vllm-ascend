@@ -1,0 +1,78 @@
+@startuml reuse_process
+participant "P 模型 / NPU stream" as P
+participant "MultiConnector" as Multi
+participant "P layerwise sender" as Send
+participant "Store 保存 / 接收线程" as Store
+database "Mooncake Store" as Pool
+participant "D scheduler / 接收控制" as D
+participant "D manager / attention" as Runtime
+
+D -> D : scheduler 分配并保留各组 blocks / 分配代次
+D -> Runtime : acquire_target(request, BlockAllocation)：绑定物理池视图
+Runtime --> D : TargetLease / CacheView / 分配代次
+D -> D : 注册目标区域，绑定注册代次与 lease
+D -> Send : 发布 TargetManifest / writer_plan / block IDs
+Send --> D : 校验布局与请求实例，接收目标成功
+note over P, D
+D 不等待完整 P 结果才发布地址；资源不足时先背压。
+目标就绪后才能进入会复用源槽位的 P 执行。
+end note
+loop 当前 chunk 的每个逻辑层 L
+ Store -> Store : 等待 L 目标槽位旧代的计算和 Store 源读取
+ Store -> Multi : external slot waiter(L)
+ Multi -> Send : wait_for_layer_reuse(L)
+ Send --> Store : 旧代封口且全部成功才返回；无旧占用者直接返回
+ break 屏障失败
+  Store --> P : 禁止覆盖，失败退出；保留仍在途的分配
+ end
+ Store -> Store : begin_slot_write(L)：推进槽位 epoch
+ Store -> Send : open_epoch：在任何 GET / scatter 写入前登记
+ opt L 需要历史 KV
+  Store -> Pool : GET L 的已提交快照
+  Pool --> Store : 恢复完成或错误
+ end
+ break 恢复失败
+  Store --> P : 禁止计算及发送，失败退出
+ end
+ Store --> P : 历史 KV 就绪；无 GET 也已执行旧代屏障
+ P -> Multi : KV-ready / save hook
+ Multi -> Send : reserve_read：按 SlotEpoch / TransferKey 登记全部计划
+ Multi -> Send : seal_epoch：计划完整，不再新增读者
+ Multi -> Store : 发布 L 的保存任务
+ par attention 读取
+  P -> P : 完成 L 的计算读取事件
+ else Store 保存
+  Store -> Pool : L 的 range PUT
+  Pool --> Store : 本层源读取完成，或失败
+ else P/D 分路径传输
+  Send -> Runtime : Indexer D2D，同步完成语义
+  Runtime --> Send : Indexer 完成或失败
+  Send -> Runtime : Main D2RH：仅指定 writer 的范围，同步完成语义
+  Runtime --> Send : Main 完成或失败
+  Send -> Send : complete_read：分别记录终态与源静止状态
+  Send -> D : 组件 / 层 / chunk 结果（可合并通知）
+ end
+
+end
+note over Send, Store
+失败可先通知；源未静止时继续保留分配。
+随后更新静止状态只释放引用，不清除失败。
+end note
+Store -> Pool : 最后相关层结束后提交本 chunk 快照
+note over Store, Pool
+整对象提交不阻塞本 chunk 内的槽位轮换。
+end note
+D -> D : 汇总各 backing Main 并集 / 各消费 rank Indexer / 全部 terminal
+alt 所有必要数据成功就绪
+ D -> Runtime : ReceiveReceipt / prepare_decode
+ Runtime -> Runtime : 接入可见性依赖后允许 decode
+ Runtime -> Runtime : Indexer 选取 / Host 稀疏访问 / 新 KV 写回
+else 缺失或失败
+ D -> D : 不发布成功，不在缺 Main HBM 时重算
+end
+note over D, Runtime
+取消／抢占先禁止新传输，保留 scheduler blocks。
+远端写入和本地 runtime 静止后才能确认安全回收。
+tensor 引用不能代替 scheduler block retention。
+end note
+@enduml

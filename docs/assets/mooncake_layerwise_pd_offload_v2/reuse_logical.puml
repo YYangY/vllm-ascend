@@ -1,0 +1,45 @@
+@startuml reuse_logical
+left to right direction
+skinparam componentStyle rectangle
+package "P 端" {
+ component "布局 / runner hooks" as Runner <<扩展-A>>
+ component "MultiConnector" as Multi <<扩展-B>>
+ component "AscendStore worker / receiver\n私有快照版本与恢复" as Store <<扩展-A>>
+ component "Layerwise P/D sender\nSlotEpoch / ticket / seal / completion" as Sender <<扩展-B>>
+}
+package "D 端：Host Main / HBM Indexer" {
+ component "D scheduler\n请求 block 分配 / retention" as Scheduler <<适配-B>>
+ component "Layerwise 接收控制\n目标地址与请求完成汇总" as Receiver <<扩展-B>>
+ component "SparseKVOffloadManager\nHost 分配与写回" as Manager <<现有接入-A>>
+ component "SFA offload attention\nfused overlap" as Attn <<现有接入-A>>
+ database "Host Main KV" as Host
+ database "HBM Indexer\n及 selection buffer" as Device
+}
+database "Mooncake Store\nP 历史 KV 对象" as Pool <<现有>>
+Runner --> Multi : KV-ready / save / load hooks
+Multi --> Sender : 先登记 pending
+Multi --> Store : 再发布 Store 工作
+Multi ..> Store : 注册外部 waiter
+Store ..> Multi : 覆盖前等待
+Multi ..> Sender : wait_for_layer_reuse
+Store --> Pool : range PUT / GET
+Receiver ..> Sender : TargetManifest / writer_plan / 注册代次 / block IDs
+Sender --> Device : 逐层 Indexer D2D
+Sender --> Host : 逐层 Main D2RH / 唯一 writer
+Sender --> Receiver : 分组件完成 / 失败通知
+Manager --> Host : 分配、所有权与新 token 写回
+Manager --> Device : 分配与缓存管理
+Scheduler --> Receiver : BlockAllocation / 分配代次
+Receiver ..> Manager : acquire_target / TargetLease / CacheView
+Receiver --> Scheduler : 传输和 runtime 静止后的安全回收确认
+Receiver --> Attn : ReceiveReceipt + 可见性依赖后放行
+Attn --> Manager : 稀疏访问 / 写回
+note bottom of Sender
+GitCode ToDram 提供逐层 push 参考。
+释放 P 槽位不等于 D 请求已就绪。
+end note
+note bottom of Pool
+Store 对象池与 D 的 Host KV pool 是两套生命周期。
+普通 D HBM 模式作为兼容性回归路径。
+end note
+@enduml
