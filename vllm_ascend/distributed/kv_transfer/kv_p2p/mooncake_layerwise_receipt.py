@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Receipt/Slot ledgers for layerwise PD transfer (pure state machines).
 
-- :class:`ReceiptLedger` (D side): judge readiness by identity per v2 §6.2.3's
-  four conditions + protocol-error clause (08 §4). Replaces the old
+- :class:`ReceiptLedger` (D side): judge readiness by identity's
+  four conditions + protocol-error clause. Replaces the old
   "count DONE messages reported by P" logic, which deadlocks or silently
   passes once DONE becomes per-(layer, component, rank, range).
 - :class:`SlotLedger` (P side): reuse barrier for shared physical KV slots,
   keyed by *slot id* — the address-derived identity from the baseline
-  ``_init_layerwise_reuse_state`` (ruling D1, v2 §3: the planner is the only
+  ``_init_layerwise_reuse_state`` (the planner is the only
   source of the layer→slot mapping; never re-derive by modulo).
 
 Hard rule: pure stdlib. No torch / torch_npu / zmq / vllm / msgspec imports.
@@ -18,8 +18,8 @@ import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Callable, Iterable
 
 try:  # in-repo import (real deployment and stub-bootstrapped unit tests)
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
@@ -27,7 +27,6 @@ try:  # in-repo import (real deployment and stub-bootstrapped unit tests)
         ReceiveReceipt,
         RequestKey,
         Status,
-        TokenRange,
         TransferKey,
         TransferResult,
     )
@@ -37,7 +36,6 @@ except ModuleNotFoundError:  # direct top-level loading (bare test harnesses)
         ReceiveReceipt,
         RequestKey,
         Status,
-        TokenRange,
         TransferKey,
         TransferResult,
     )
@@ -47,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 def _ranges_cover(ranges: Iterable[tuple[int, int]], total: int) -> bool:
     """True if the merged half-open ranges cover [0, total). Sort by start,
-    keep current end; a start beyond current means a gap (08 §4.4)."""
+    keep current end; a start beyond current means a gap."""
     if total <= 0:
         return True
     cur = 0
@@ -64,12 +62,12 @@ def _ranges_cover(ranges: Iterable[tuple[int, int]], total: int) -> bool:
 def is_no_compute_layer(computed_tokens: Iterable[int], prompt_tokens: Iterable[int]) -> bool:
     """True when EVERY request on this layer was fully prefix-hit
     (computed >= prompt > 0): nothing was computed here, so the layer has no
-    compute reader and is marked ``no_compute_reader`` (v2 §5.8, 08 §7-⑧) —
+    compute reader and is marked ``no_compute_reader`` —
     its send path must never wait on a compute-done event.
 
     An empty request set (or a degenerate prompt) gives no evidence -> False,
     i.e. treat the layer as compute-present and record the event. Pure stdlib
-    so UT19 runs on any box; the connector calls this from save_kv_layer.
+    so it is testable on any box; the connector calls this from save_kv_layer.
     """
     found_any = False
     for computed, prompt in zip(computed_tokens, prompt_tokens):
@@ -80,7 +78,7 @@ def is_no_compute_layer(computed_tokens: Iterable[int], prompt_tokens: Iterable[
 
 
 class ReceiptLedger:
-    """D-side readiness ledger for one request instance (08 §4).
+    """D-side readiness ledger for one request instance.
 
     Created after ``publish_target`` succeeds — ``expected_ranks`` comes from
     the TargetManifest, which is only published after registration and
@@ -113,7 +111,7 @@ class ReceiptLedger:
     # ------------------------------------------------------------- record
 
     def record(self, result: TransferResult) -> None:
-        """Judge one transfer result. Order is fixed (08 §4.3), do not reorder:
+        """Judge one transfer result. Order is fixed, do not reorder:
         1. identity mismatch -> stale, dropped, only old references cleared
         2. same key exists -> conflicts never flip an existing verdict;
            only source_quiesced False->True may be merged
@@ -192,7 +190,7 @@ class ReceiptLedger:
 
     def mark_visible(self, rank: int) -> None:
         """Record that the consumer stream dependency is wired for ``rank``.
-        Only call after A's prepare_decode returned normally (08 §4.2)."""
+        Only call after prepare_decode returned normally."""
         self._visible.add(rank)
 
     # ----------------------------------------------------------- judgment
@@ -200,7 +198,7 @@ class ReceiptLedger:
     def _data_ready(self) -> bool:
         """Data-side conditions only (unions + terminals + no protocol errors),
         without visibility. Gates building the receipt for prepare_decode —
-        visibility is the *outcome* of that call (08 §4.8), so it must not be
+        visibility is the *outcome* of that call, so it must not be
         a precondition here."""
         if self._conflicts or self._invalid_results:
             return False
@@ -208,16 +206,12 @@ class ReceiptLedger:
             return False
         if any(status is not Status.SUCCESS for status in self._terminals.values()):
             return False
-        for backing in self.main_backings:
-            if not _ranges_cover(self._main_ranges.get(backing, ()), self.prompt_len):
-                return False
-        for rank in self.indexer_ranks:
-            if not _ranges_cover(self._indexer_ranges.get(rank, ()), self.prompt_len):
-                return False
-        return True
+        return all(
+            _ranges_cover(self._main_ranges.get(backing, ()), self.prompt_len) for backing in self.main_backings
+        ) and all(_ranges_cover(self._indexer_ranges.get(rank, ()), self.prompt_len) for rank in self.indexer_ranks)
 
     def should_publish(self) -> bool:
-        """Full conjunction of 08 §4.4 (data conditions + every expected rank
+        """Full conjunction (data conditions + every expected rank
         visible + no protocol errors); pure query, no side effects. This is the
         gate for handing the request to ``done_requests``/``get_finished``."""
         return self._data_ready() and self.expected_ranks <= self._visible
@@ -273,7 +267,7 @@ class _ResultEntry:
 
 
 # --------------------------------------------------------------------------
-# SlotLedger (P side reuse barrier) — slot-keyed per ruling D1
+# SlotLedger (P side reuse barrier) — slot-keyed per
 # --------------------------------------------------------------------------
 
 
@@ -285,7 +279,7 @@ class SlotError(Exception):
 @dataclass
 class _Ticket:
     """One reader of one layer generation. ``quiesced`` releases the source;
-    a FAILED + quiesced=False ticket must keep holding the source (08 §5.2)."""
+    a FAILED + quiesced=False ticket must keep holding the source."""
 
     key: TransferKey
     done: bool = False
@@ -308,13 +302,13 @@ class _Generation:
 
 
 class SlotLedger:
-    """Per-slot generation + ticket ledger (08 §5 as amended by ruling D1).
+    """Per-slot generation + ticket ledger.
 
     Keys are *slot ids* — the same address-derived identity as the baseline
     ``layer_storage_slots`` — never layer numbers. One layer's slots share one
     ticket per key, so a layer mapping to several slots still counts once.
 
-    ``wait`` implements the snapshot rule (D1/C3):
+    ``wait`` implements the snapshot rule:
       1. current epoch == snapshot epoch and sealed with nothing pending -> done
       2. current epoch > snapshot epoch -> old generation fully ended
          (advancing requires all tickets quiesced), return without chasing
@@ -348,7 +342,7 @@ class SlotLedger:
     ) -> tuple[tuple[int, int], ...]:
         """Register one layer's whole send batch and (by default) seal at once:
         advance each slot's epoch, register all tickets, then seal — the batch
-        plan is complete at this point (08 §5.2).
+        plan is complete at this point.
 
         Raises SlotError when a slot's current generation still has pending
         (non-quiesced) tickets: that means the reuse wait did not take effect.
@@ -453,14 +447,14 @@ class SlotLedger:
 
     def wait(self, layer: int, timeout: float) -> None:
         """Block until every slot of ``layer`` has its *snapshot* generation
-        quiesced (three-branch rule, D1/C3). Cheap and idempotent when nothing
-        is pending (§5.3-2). Raises SlotError on failure, TimeoutError on time.
+        quiesced (three-branch rule). Cheap and idempotent when nothing
+        is pending. Raises SlotError on failure, TimeoutError on time.
 
         The snapshot is taken once at entry and never refreshed: a newer
         generation may only exist after the snapshot generation was fully
         quiesced (see ``register_batch`` guard), so branch 2 may return while a
         newer generation is still in flight — it has no readers of the
-        snapshot generation and chasing it would deadlock (09 D1)."""
+        snapshot generation and chasing it would deadlock ."""
         slots = self._slots(layer)
         with self._cond:
             snapshot: dict[int, int | None] = {}
@@ -484,8 +478,7 @@ class SlotLedger:
                     for ticket in gen.tickets.values():
                         if ticket.failed:
                             raise SlotError(
-                                f"slot {slot}: generation {gen.epoch} has failed transfers "
-                                f"(key={ticket.key})"
+                                f"slot {slot}: generation {gen.epoch} has failed transfers (key={ticket.key})"
                             )
                     if any(t.pending for t in gen.tickets.values()):
                         ready = False
@@ -494,8 +487,7 @@ class SlotLedger:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
-                        f"layerwise slot reuse wait timed out for layer {layer} "
-                        f"(slots={slots}, snapshot={snapshot})"
+                        f"layerwise slot reuse wait timed out for layer {layer} (slots={slots}, snapshot={snapshot})"
                     )
                 self._cond.wait(remaining)
 

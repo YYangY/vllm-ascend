@@ -1,11 +1,11 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
-"""Connector-level tests for the layerwise receipt protocol (08 §9).
+"""Connector-level tests for the layerwise receipt protocol.
 
 These need the real connector module (torch / torch_npu / vllm / mooncake), so
 they skip on CPU-only boxes — the ledger/contract logic they rely on is covered
-by test_layerwise_receipt.py, which runs anywhere. #19 exercises the
-save_kv_layer no-compute marking end to end and belongs on the NPU CI.
+by test_layerwise_receipt.py, which runs anywhere. The no-compute marking
+case exercises save_kv_layer end to end and belongs on the NPU CI.
 """
 
 import pytest
@@ -23,7 +23,7 @@ def _encode_decode(msg):
 
 
 class WireFormatTests:
-    """08 §6.1/§6.2: positional arrays only; the decoder is Decoder(type=tuple),
+    """Positional arrays only; the decoder is Decoder(type=tuple),
     so a map-encoded message must fail loudly, never silently mis-bind."""
 
     def test_layer_result_roundtrip(self):
@@ -54,7 +54,7 @@ class WireFormatTests:
 
         encoder = msgspec_mod.msgpack.Encoder()
         decoder = msgspec.msgpack.Decoder(type=tuple)
-        with pytest.raises(Exception):
+        with pytest.raises(msgspec.ValidationError):
             decoder.decode(encoder.encode({"type": lc.LAYER_RESULT_MSG, "version": lc.CONTRACT_VERSION}))
 
 
@@ -94,14 +94,13 @@ class ReceiptHandlerTests:
 
 
 class PrefixHitNoComputeTests:
-    """08 §9 #19 (v2 §5.8): a layer whose requests are all fully prefix-hit has
+    """Prefix-hit a layer whose requests are all fully prefix-hit has
     no compute reader — it must be marked no_compute_reader and must not hang
     the send path waiting on a compute-done event that will never come."""
 
-    def test_ut19_no_compute_layer_is_marked(self):
+    def test_no_compute_layer_is_marked(self):
         pytest.importorskip("vllm")
         worker = object.__new__(lc.MooncakeLayerwiseConnectorWorker)
-        import threading
 
         worker.vllm_config = None  # set below via a stub config
         worker.current_layer = 0

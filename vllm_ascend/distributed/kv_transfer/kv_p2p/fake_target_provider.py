@@ -1,19 +1,19 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
-"""Test double for the A-side ``TargetProvider`` (v2 §5.6 / 08 §2).
+"""Test double for the store-side ``TargetProvider``.
 
 Same interface as the production implementation, pure stdlib, referenced only
 by unit tests and the contract tests. Production code must never import this
-module (there is exactly one allocator; v2 §5.9).
+module (there is exactly one allocator).
 
 Behavior is scriptable per test:
 - ``lease_factory`` builds the TargetLease for ``acquire_target``;
-- ``prepare_error`` / ``release_error`` inject exceptions (UT20 / failure paths);
+- ``prepare_error`` / ``release_error`` inject exceptions (failure paths);
 - every call is recorded for assertions (``acquire_calls`` etc.).
 """
 
 import logging
-from typing import Callable
+from collections.abc import Callable
 
 try:  # in-repo import (real deployment and stub-bootstrapped unit tests)
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
@@ -129,7 +129,7 @@ class FakeTargetProvider:
         return self._lease_factory(request, allocation)
 
     def get_target_views(self, lease: TargetLease) -> tuple[CacheView, ...]:
-        # Flat tuple per v2 §5.6 (ruling D4); consumers group by view.component.
+        # Flat tuple; consumers group by view.component.
         return tuple(self.view_overrides.get(lease.request, lease.views))
 
     def prepare_decode(self, lease: TargetLease, receipt) -> None:

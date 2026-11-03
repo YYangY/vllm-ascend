@@ -102,16 +102,16 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     @staticmethod
     def _receipt_mode_requested(connector) -> bool:
         """Layerwise receipt mode is opted in per engine via the kv-transfer
-        extra config key ``layerwise_receipt_mode`` (v2 §5.8 mode flag)."""
+        extra config key ``layerwise_receipt_mode`` ."""
         config = getattr(connector, "vllm_config", None)
         kv_transfer = getattr(config, "kv_transfer_config", None) if config is not None else None
         extra = getattr(kv_transfer, "kv_connector_extra_config", None) or {}
         return bool(extra.get("layerwise_receipt_mode", False))
 
     def _configure_target_provider(self) -> None:
-        """TargetProvider injection (ruling D2, 08 §7-⑪+). Three-way decision:
+        """TargetProvider injection. Three-way decision:
         - mode off + no provider -> skip (legal, plain mode);
-        - mode on + no provider -> startup failure (v2 §5.8: no silent
+        - mode on + no provider -> startup failure (no silent
           degradation when the feature was requested);
         - more than one provider -> startup failure (exactly one D-target store).
         The discovered provider must pass the facade's capability probe, which
@@ -128,7 +128,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             if any(self._receipt_mode_requested(connector) for connector in self._connectors):
                 raise ValueError(
                     "layerwise_receipt_mode is enabled but no connector exposes a TargetProvider "
-                    "(acquire_target); refusing to start (v2 §5.8)"
+                    "(acquire_target); refusing to start"
                 )
             return
         for connector in self._connectors:

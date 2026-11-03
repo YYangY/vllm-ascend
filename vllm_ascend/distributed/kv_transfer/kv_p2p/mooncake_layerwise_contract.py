@@ -1,14 +1,15 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
-"""Layerwise PD transfer contract shared between connector side (B) and store side (A).
+"""Layerwise PD transfer contract shared between the connector side and the store side.
 
-Owner: B (sole naming & maintenance authority); consumed by A to implement
-``TargetProvider``. Freeze basis: PD design v2 §5.4/§5.6 plus the 2026-11-03
-contract rulings (vault note ``09 接口拍板与联调待确认 — B 侧``, decisions D2-D4):
-- ``get_target_views`` returns a flat ``tuple[CacheView, ...]`` (v2 §5.6 verbatim);
-  consumers group by ``CacheView.component`` themselves (D4).
-- ``release_target(lease) -> None``; its normal return is A's promise that A-side
-  references (physical pool + write-back) are already dropped (D3).
+Owner: the connector side (sole naming & maintenance authority); consumed by
+the store side to implement ``TargetProvider``. This file is the interface
+authority for the layerwise PD transfer.
+- ``get_target_views`` returns a flat ``tuple[CacheView, ...]``;
+  consumers group by ``CacheView.component`` themselves.
+- ``release_target(lease) -> None``; its normal return is the provider's
+  promise that store-side references (physical pool + write-back) are already
+  dropped.
 Hard rule: pure stdlib. No torch / torch_npu / zmq / vllm / msgspec imports, so
 this module (and its unit tests) run in CPU-only CI.
 """
@@ -29,7 +30,7 @@ _MEMORY_KINDS = ("host", "device")
 class ContractError(Exception):
     """Contract violation.
 
-    Startup time -> abort startup (v2 §5.8, no silent degradation).
+    Startup time -> abort startup (no silent degradation).
     Request time -> fail that request only.
     """
 
@@ -105,9 +106,9 @@ class TokenRange:
 @dataclass(frozen=True)
 class RequestKey:
     """Request identity. ``request_instance`` is generated once per request
-    lifetime on the D scheduler (uuid4().hex, ruling D5) and reaches P via
+    lifetime on the D scheduler (uuid4().hex) and reaches P via
     kv_transfer_params; ``transfer_generation`` is allocated by D when the
-    target is published (initial 0), bumped only on preempt/retry (D6)."""
+    target is published (initial 0), bumped only on preempt/retry."""
 
     request_instance: str
     transfer_generation: int
@@ -136,7 +137,7 @@ class TargetScope:
 
 @dataclass(frozen=True)
 class TransferKey:
-    """Seven-field identity of one (layer, component, range) transfer (v2 §5.4).
+    """Seven-field identity of one (layer, component, range) transfer.
     Frozen and hashable; all seven fields participate."""
 
     request: RequestKey
@@ -165,8 +166,8 @@ class TransferKey:
 
 @dataclass(frozen=True)
 class BlockAllocation:
-    """D-scheduler allocation facts handed to A's ``acquire_target`` (v2 §5.4).
-    B is read-only here. ``group_block_ids`` is group-major."""
+    """D-scheduler allocation facts handed to the provider's ``acquire_target``.
+    The connector is read-only here. ``group_block_ids`` is group-major."""
 
     request: RequestKey
     allocation_generation: int
@@ -207,7 +208,7 @@ class LocalRegion:
 
 @dataclass(frozen=True)
 class RegisteredRegion:
-    """One registered memory region published to the remote side (v2 §5.4)."""
+    """One registered memory region published to the remote side."""
 
     engine_instance: str
     registration_generation: int
@@ -234,7 +235,7 @@ class RegisteredRegion:
 
 @dataclass(frozen=True)
 class CacheView:
-    """How a component's layer KV lays out inside a registered region (v2 §5.4)."""
+    """How a component's layer KV lays out inside a registered region."""
 
     component: Component
     logical_layer: int
@@ -259,7 +260,7 @@ class CacheView:
         _require_int("CacheView.page_size_tokens", self.page_size_tokens, minimum=1)
         _require_int("CacheView.manager_block_size_tokens", self.manager_block_size_tokens, minimum=1)
         if self.manager_block_size_tokens % self.page_size_tokens != 0:
-            # First-version restriction (08 §3.2); startup validation also fails fast on this.
+            # First-version restriction; startup validation also fails fast on this.
             raise ContractError(
                 f"manager_block_size_tokens({self.manager_block_size_tokens}) must be a multiple of "
                 f"page_size_tokens({self.page_size_tokens})"
@@ -271,9 +272,9 @@ class CacheView:
 
 @dataclass(frozen=True)
 class WriterPlan:
-    """Who writes which backing over which ranges. Ranks per v2 §6.2.3
-    ``writer_ranks[destination_ordinal % len(writer_ranks)]``; B builds this and
-    proves coverage at startup (08 §8). Treat inner dicts as immutable."""
+    """Who writes which backing over which ranges. Ranks
+    ``writer_ranks[destination_ordinal % len(writer_ranks)]``; the connector builds this and
+    proves coverage at startup. Treat inner dicts as immutable."""
 
     writers_by_backing: dict[str, tuple[int, ...]] = field(default_factory=dict)
     ranges_by_backing: dict[str, tuple[TokenRange, ...]] = field(default_factory=dict)
@@ -282,7 +283,7 @@ class WriterPlan:
 @dataclass(frozen=True)
 class TargetLease:
     """Acquired target: binds RegisteredRegions + CacheViews + WriterPlan to one
-    request (v2 §5.6). Regions must not repeat (backing_id, backing_generation)."""
+    request. Regions must not repeat (backing_id, backing_generation)."""
 
     contract_version: int
     request: RequestKey
@@ -319,9 +320,9 @@ class TargetLease:
 
 @dataclass
 class ReceiveReceipt:
-    """D-side readiness receipt handed to A's ``prepare_decode`` (v2 §5.6).
+    """D-side readiness receipt handed to the provider's ``prepare_decode``.
     ``visible`` starts False and is set True only after prepare_decode returns
-    normally (A's normal return = consumer stream dependency wired in, D3)."""
+    normally (normal return = consumer stream dependency wired in)."""
 
     request: RequestKey
     target_generation: int
@@ -341,9 +342,9 @@ class ReceiveReceipt:
 
 @dataclass(frozen=True)
 class ReleaseAck:
-    """Safe-release confirmation B returns to the scheduler (v2 §5.6 flow).
-    Produced by B itself (ruling D3): DMA quiescence from B's ledger, lease
-    refs per A's release_target promise, retention from the scheduler."""
+    """Safe-release confirmation returned to the scheduler .
+    Produced by the connector: DMA quiescence from its ledger, lease
+    refs per the provider's release_target promise, retention from the scheduler."""
 
     safe_to_release: bool
     retention_token: str | None = None
@@ -359,7 +360,7 @@ class ReleaseAck:
 
 @dataclass(frozen=True)
 class TransferResult:
-    """One (layer, component, range) transfer outcome, as defined in v2 §5.4.
+    """One (layer, component, range) transfer outcome.
     Carries the full TransferKey so the D-side ledger can judge by identity."""
 
     key: TransferKey
@@ -382,10 +383,10 @@ class TransferResult:
 
 @runtime_checkable
 class TargetProvider(Protocol):
-    """A-side provider interface, verbatim per v2 §5.6 (rulings: all-v2).
+    """Store-side provider interface.
 
-    A implements this on its connector worker; B discovers the object (D2),
-    checks capabilities at startup (§5.8), and calls it per request.
+    Implemented on the store-side connector worker; the connector discovers the object,
+    checks capabilities at startup, and calls it per request.
     """
 
     contract_version: int
@@ -394,24 +395,24 @@ class TargetProvider(Protocol):
 
     def acquire_target(self, request: RequestKey, allocation: BlockAllocation) -> TargetLease:
         """Acquire the D-side target for one request. Must cover the full prompt
-        for both components or raise; no partial targets (v2 §5.6)."""
+        for both components or raise; no partial targets."""
         ...
 
     def get_target_views(self, lease: TargetLease) -> tuple[CacheView, ...]:
-        """Return the CacheViews as a flat tuple (D4). Each view carries its own
+        """Return the CacheViews as a flat tuple. Each view carries its own
         ``region_binding`` and ``component``; never rely on list order."""
         ...
 
     def prepare_decode(self, lease: TargetLease, receipt: ReceiveReceipt) -> None:
-        """Validate identity and wire the consumer stream dependency (v2 §5.6).
+        """Validate identity and wire the consumer stream dependency.
         Normal return = dependency is wired. Raise on anything unsafe; raising
         must leave the request invisible (never published)."""
         ...
 
     def release_target(self, lease: TargetLease) -> None:
-        """Initiate release. Ruling D3: normal return is A's promise that A-side
+        """Initiate release. Normal return is the provider's promise that store-side
         references (physical pool refs + write-back readers) are already
-        dropped; B derives the scheduler-facing ReleaseAck from this promise
+        dropped; the connector derives the scheduler-facing ReleaseAck from this promise
         plus its own DMA quiescence. Raise if unsafe to release."""
         ...
 
@@ -420,7 +421,7 @@ _PROVIDER_METHODS = ("acquire_target", "get_target_views", "prepare_decode", "re
 
 
 def assert_provider_capabilities(provider: Any) -> None:
-    """Startup gate (v2 §5.8): four methods callable + version/visibility/reuse.
+    """Startup gate four methods callable + version/visibility/reuse.
     Raises ContractError listing every missing capability -> startup aborts."""
 
     problems: list[str] = []
@@ -445,7 +446,7 @@ def assert_provider_capabilities(provider: Any) -> None:
 
 
 def assert_lease_consistent(lease: TargetLease, request: RequestKey) -> None:
-    """Per-request gate before the target is used (08 §3.3). Raises
+    """Per-request gate before the target is used. Raises
     ContractError -> that request fails; other requests continue."""
 
     if isinstance(lease.contract_version, bool) or not isinstance(lease.contract_version, int):

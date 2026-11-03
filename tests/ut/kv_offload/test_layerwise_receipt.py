@@ -1,17 +1,17 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the layerwise PD transfer ledgers and contract (08 §9).
+"""Unit tests for the layerwise PD transfer ledgers and contract.
 
-Pure stdlib, CPU-only, no torch/vllm/zmq/msgspec needed. Covers the 22-case
-acceptance list except #19 (prefix-hit no-compute reader), which exercises the
-connector's save_kv_layer wiring and lives in test_layerwise_connector.py.
+Pure stdlib, CPU-only, no torch/vllm/zmq/msgspec needed. Covers the
+ledger/contract cases except the prefix-hit no-compute reader,
+which exercises the connector's save_kv_layer wiring and lives in
+test_layerwise_connector.py.
 
 Run:  python tests/ut/kv_offload/test_layerwise_receipt.py -v
       (or python -m pytest tests/ut/kv_offload/test_layerwise_receipt.py)
 """
 
 import importlib
-import logging
 import random
 import sys
 import threading
@@ -128,7 +128,7 @@ def make_ledger(request: RequestKey, *, indexer_ranks=INDEXER_RANKS) -> ReceiptL
 
 
 def populate_data(ledger: ReceiptLedger, request: RequestKey, *, first_half_only: bool = False) -> None:
-    """Feed full data coverage (08 §4.4 semantics): MAIN is a per-backing union
+    """Feed full data coverage: MAIN is a per-backing union
     split across senders; INDEXER coverage is per *consumer* rank, each of whom
     must see the whole prompt (senders may differ from consumers)."""
     spans = ((0, PROMPT // 2),) if first_half_only else ((0, PROMPT // 2), (PROMPT // 2, PROMPT))
@@ -154,7 +154,7 @@ def complete_terminals(ledger: ReceiptLedger, request: RequestKey) -> None:
 
 
 class ReceiptPublishGates(TestCase):
-    """UT1, UT2, UT3/4, UT7, UT16, UT17 — the §4.4 conjunction."""
+    """Readiness conjunction edge cases: missing segments, absent ranks, invisible and invalid backings."""
 
     def _ready_ledger(self, request: RequestKey) -> ReceiptLedger:
         ledger = make_ledger(request)
@@ -164,7 +164,7 @@ class ReceiptPublishGates(TestCase):
             ledger.mark_visible(rank)
         return ledger
 
-    def test_ut1_missing_main_segment_and_duplicate_terminal_blocks(self):
+    def test_missing_main_segment_and_duplicate_terminal_blocks(self):
         request = make_request()
         ledger = make_ledger(request)
         # MAIN: only rank 0's half arrives; rank 1's segment is missing.
@@ -181,7 +181,7 @@ class ReceiptPublishGates(TestCase):
         ledger.record(make_result(make_key(request, rank=1, component=Component.MAIN, start=4, end=8)))
         self.assertTrue(ledger.should_publish())
 
-    def test_ut2_rank_with_main_but_no_indexer_blocks(self):
+    def test_rank_with_main_but_no_indexer_blocks(self):
         request = make_request()
         ledger = make_ledger(request)
         # rank 1 sends MAIN but never sends any INDEXER range to consumer 1.
@@ -195,7 +195,7 @@ class ReceiptPublishGates(TestCase):
         ledger.record(make_result(make_key(request, rank=0, component=Component.INDEXER, start=0, end=8, consumer=1)))
         self.assertTrue(ledger.should_publish())
 
-    def test_ut3_empty_payload_without_terminal_blocks(self):
+    def test_empty_payload_without_terminal_blocks(self):
         request = make_request()
         # rank 1 is a sender with an empty payload, not an indexer consumer here.
         ledger = make_ledger(request, indexer_ranks=(0,))
@@ -206,18 +206,18 @@ class ReceiptPublishGates(TestCase):
         self.assertFalse(ledger.should_publish())  # rank 1 terminal missing
         self.assertIn(1, ledger.pending_ranks)
 
-    def test_ut4_empty_payload_with_terminal_publishes(self):
+    def test_empty_payload_with_terminal_publishes(self):
         request = make_request()
         ledger = make_ledger(request, indexer_ranks=(0,))
         ledger.record(make_result(make_key(request, rank=0, component=Component.MAIN, start=0, end=8)))
         ledger.record(make_result(make_key(request, rank=0, component=Component.INDEXER, start=0, end=8, consumer=0)))
         ledger.finish_rank(0, Status.SUCCESS)
-        ledger.finish_rank(1, Status.SUCCESS)  # empty payload still sends its terminal (v2 §5.7-4)
+        ledger.finish_rank(1, Status.SUCCESS)  # empty payload still sends its terminal
         ledger.mark_visible(0)
         ledger.mark_visible(1)
         self.assertTrue(ledger.should_publish())
 
-    def test_ut7_data_complete_but_invisible_blocks(self):
+    def test_data_complete_but_invisible_blocks(self):
         request = make_request()
         ledger = make_ledger(request)
         populate_data(ledger, request)
@@ -227,7 +227,7 @@ class ReceiptPublishGates(TestCase):
             ledger.mark_visible(rank)
         self.assertTrue(ledger.should_publish())
 
-    def test_ut16_two_backings_only_one_blocks_plus_invalid_backing(self):
+    def test_two_backings_only_one_blocks_plus_invalid_backing(self):
         request = make_request()
         ledger = ReceiptLedger(
             request=request,
@@ -245,19 +245,19 @@ class ReceiptPublishGates(TestCase):
         self.assertFalse(ledger.should_publish())  # backing b1 got nothing
         ledger.record(make_result(make_key(request, rank=1, component=Component.MAIN, start=0, end=8, backing="b1")))
         self.assertTrue(ledger.should_publish())
-        # un-enrolled backing -> invalid, blocks again (08 §4.3-3)
+        # un-enrolled backing -> invalid, blocks again
         ledger.record(make_result(make_key(request, rank=0, component=Component.MAIN, start=0, end=8, backing="bz")))
         self.assertEqual(ledger.invalid_results, 1)
         self.assertFalse(ledger.should_publish())
 
-    def test_ut17_two_chunks_accumulate_within_one_generation(self):
+    def test_two_chunks_accumulate_within_one_generation(self):
         request = make_request()
         ledger = make_ledger(request, indexer_ranks=(0,))
-        # chunk 1 covers [0, 4); terminal NOT sent mid-chunk (§3.1: middle chunks don't)
+        # chunk 1 covers [0, 4); terminal NOT sent mid-chunk (middle chunks never carry one)
         ledger.record(make_result(make_key(request, rank=0, component=Component.MAIN, start=0, end=4)))
         ledger.record(make_result(make_key(request, rank=0, component=Component.INDEXER, start=0, end=4, consumer=0)))
         self.assertFalse(ledger.should_publish())
-        # chunk 2 covers the rest; generation unchanged (07 §4.2-3)
+        # chunk 2 covers the rest; generation unchanged
         ledger.record(make_result(make_key(request, rank=0, component=Component.MAIN, start=4, end=8, op=1)))
         ledger.record(
             make_result(make_key(request, rank=0, component=Component.INDEXER, start=4, end=8, op=1, consumer=0))
@@ -269,9 +269,9 @@ class ReceiptPublishGates(TestCase):
 
 
 class ReceiptConflictAndIdentity(TestCase):
-    """UT5, UT6, UT8(receipt half), UT13, UT14, UT15, UT18 — §4.3 ordering."""
+    """Result recording rules: failure precedence, duplicates, generations, unexpected terminals."""
 
-    def test_ut5_failed_then_success_keeps_failure_and_conflicts(self):
+    def test_failed_then_success_keeps_failure_and_conflicts(self):
         request = make_request()
         key = make_key(request)
         ledger = make_ledger(request)
@@ -280,7 +280,7 @@ class ReceiptConflictAndIdentity(TestCase):
         self.assertEqual(ledger.conflicts, 1)
         self.assertFalse(ledger.should_publish())
 
-    def test_ut6_duplicate_success_is_idempotent(self):
+    def test_duplicate_success_is_idempotent(self):
         request = make_request()
         key = make_key(request)
         ledger = make_ledger(request)
@@ -290,7 +290,7 @@ class ReceiptConflictAndIdentity(TestCase):
         self.assertTrue(ledger._data_ready() or True)  # no crash; coverage credited once below
         self.assertEqual(len(ledger._main_ranges.get("b0", ())), 1)
 
-    def test_ut13_success_then_failed_conflicts_and_blocks(self):
+    def test_success_then_failed_conflicts_and_blocks(self):
         request = make_request()
         key = make_key(request)
         ledger = make_ledger(request)
@@ -299,7 +299,7 @@ class ReceiptConflictAndIdentity(TestCase):
         self.assertEqual(ledger.conflicts, 1)
         self.assertFalse(ledger.should_publish())
 
-    def test_ut8_quiesced_upgrade_releases_source_but_verdict_stays_failed(self):
+    def test_quiesced_upgrade_releases_source_but_verdict_stays_failed(self):
         request = make_request()
         key = make_key(request)
         ledger = make_ledger(request)
@@ -308,7 +308,7 @@ class ReceiptConflictAndIdentity(TestCase):
         self.assertEqual(ledger.conflicts, 0)  # quiesced merge is not a conflict
         self.assertFalse(ledger.should_publish())  # conclusion still failed
 
-    def test_ut14_old_generation_segments_plus_new_generation_rest_block(self):
+    def test_old_generation_segments_plus_new_generation_rest_block(self):
         old = make_request(generation=0)
         new = make_request(generation=1)
         ledger = make_ledger(new)
@@ -317,7 +317,7 @@ class ReceiptConflictAndIdentity(TestCase):
         self.assertEqual(ledger.stale_dropped, 4)
         self.assertFalse(ledger.should_publish())
 
-    def test_ut15_unexpected_rank_terminal_does_not_crash_and_logs(self):
+    def test_unexpected_rank_terminal_does_not_crash_and_logs(self):
         request = make_request()
         ledger = make_ledger(request)
         with self.assertLogs("vllm_ascend", level="WARNING") as captured:
@@ -327,9 +327,9 @@ class ReceiptConflictAndIdentity(TestCase):
         self.assertNotIn(99, ledger._terminals)
         self.assertFalse(ledger.should_publish())
 
-    def test_ut18_preempt_new_instance_invalidates_old_results(self):
+    def test_preempt_new_instance_invalidates_old_results(self):
         old = make_request(instance="old-uuid")
-        new = make_request(instance="new-uuid")  # preempt regenerates the instance (D5)
+        new = make_request(instance="new-uuid")  # preempt regenerates the instance
         ledger = make_ledger(new)
         populate_data(ledger, old)  # results from the old instance arrive at the new ledger
         self.assertGreaterEqual(ledger.stale_dropped, 4)
@@ -342,9 +342,9 @@ class ReceiptConflictAndIdentity(TestCase):
 
 
 class ReceiptFuzz(TestCase):
-    """UT12 — random shuffle/drop, 2000 iterations with a fixed seed (§4.3/§4.4)."""
+    """Random shuffle/drop fuzz, 2000 iterations with a fixed seed."""
 
-    def test_ut12_fuzz_shuffle_and_drop(self):
+    def test_fuzz_shuffle_and_drop(self):
         rng = random.Random(20261103)
         request = make_request()
 
@@ -397,8 +397,8 @@ class ReceiptFuzz(TestCase):
 
 
 def run_publish_flow(ledger: ReceiptLedger, provider, lease) -> bool:
-    """B-side orchestration of 08 §4.8 (scheduler loop would own this): data
-    ready -> receipt(visible=False) -> A.prepare_decode -> normal return ->
+    """Connector-side orchestration (scheduler loop would own this): data
+    ready -> receipt(visible=False) -> provider.prepare_decode -> normal return ->
     mark every rank visible and flip receipt.visible."""
     receipt = ledger.build_receipt()
     if receipt is None:
@@ -414,9 +414,9 @@ def run_publish_flow(ledger: ReceiptLedger, provider, lease) -> bool:
 
 
 class PrepareDecodeFlow(TestCase):
-    """UT20 — prepare_decode raising must leave the request invisible."""
+    """prepare_decode raising must leave the request invisible."""
 
-    def test_ut20_prepare_decode_error_blocks_visibility(self):
+    def test_prepare_decode_error_blocks_visibility(self):
         request = make_request()
         ledger = make_ledger(request)
         populate_data(ledger, request)
@@ -444,7 +444,7 @@ class PrepareDecodeFlow(TestCase):
 
 
 class ContractTests(TestCase):
-    """UT21 — fake/real provider contract; capability gate; lease consistency."""
+    """Fake/real provider contract; capability gate; lease consistency."""
 
     def _fake_ready_ledger(self):
         request = make_request()
@@ -453,7 +453,7 @@ class ContractTests(TestCase):
         complete_terminals(ledger, request)
         return ledger, request
 
-    def test_ut21_fake_provider_satisfies_contract(self):
+    def test_fake_provider_satisfies_contract(self):
         provider = FakeTargetProvider()
         C.assert_provider_capabilities(provider)  # must not raise
         request = make_request()
@@ -467,13 +467,13 @@ class ContractTests(TestCase):
         )
         lease = provider.acquire_target(request, allocation)
         C.assert_lease_consistent(lease, request)
-        views = provider.get_target_views(lease)  # flat tuple per ruling D4
+        views = provider.get_target_views(lease)  # flat tuple per
         self.assertIsInstance(views, tuple)
         mains = [v for v in views if v.component is Component.MAIN]
         indexers = [v for v in views if v.component is Component.INDEXER]
-        self.assertTrue(mains and indexers)  # B groups by component, never order
+        self.assertTrue(mains and indexers)  # groups by component, never order
 
-    def test_ut21_broken_providers_abort_startup(self):
+    def test_broken_providers_abort_startup(self):
         cases = {
             "missing method": type(
                 "P1",
@@ -525,11 +525,10 @@ class ContractTests(TestCase):
             ),
         }
         for label, provider_cls in cases.items():
-            with self.subTest(case=label):
-                with self.assertRaises(ContractError):
-                    C.assert_provider_capabilities(provider_cls())
+            with self.subTest(case=label), self.assertRaises(ContractError):
+                C.assert_provider_capabilities(provider_cls())
 
-    def test_ut21_lease_consistency_checks(self):
+    def test_lease_consistency_checks(self):
         request = make_request()
         provider = FakeTargetProvider()
         allocation = C.BlockAllocation(
@@ -591,21 +590,21 @@ class ContractTests(TestCase):
 
 
 class NoComputePredicateTests(TestCase):
-    """UT19 — prefix-hit, no compute (v2 §5.8, 08 §7-⑧).
+    """Prefix-hit, no compute.
 
     The no_compute_reader decision is a pure predicate (receipt module), so the
-    acceptance case has local evidence: a fully prefix-hit layer is marked
+    case has local evidence: a fully prefix-hit layer is marked
     no_compute_reader and its send path never waits on a compute-done event.
     The zero-reader slot behaviour (no tickets -> nothing pending -> wait
-    returns) is additionally covered by UT10's sealed empty batch."""
+    returns) is additionally covered by the sealed empty batch test."""
 
-    def test_ut19_no_compute_layer_marks_no_reader(self):
+    def test_no_compute_layer_marks_no_reader(self):
         self.assertTrue(R.is_no_compute_layer([8, 8], [8, 8]))  # all fully prefix-hit -> no reader
         self.assertFalse(R.is_no_compute_layer([4, 8], [8, 8]))  # any partial compute -> reader
         self.assertFalse(R.is_no_compute_layer([], []))  # no requests -> no evidence, assume compute
         self.assertFalse(R.is_no_compute_layer([8], [0]))  # degenerate prompt -> assume compute
 
-    def test_ut19_zero_reader_slot_does_not_hang(self):
+    def test_zero_reader_slot_does_not_hang(self):
         ledger = SlotLedger(lambda layer: (0,))
         ledger.register_batch(0, [], seal_immediately=False)  # prefix-hit layer: no send tickets
         with self.assertRaises(TimeoutError):
@@ -615,9 +614,9 @@ class NoComputePredicateTests(TestCase):
 
 
 class SlotLedgerTests(TestCase):
-    """UT8(slot half), UT9, UT10, UT11, UT22 — slot-keyed reuse barrier (D1)."""
+    """Slot-keyed reuse barrier."""
 
-    def test_ut8_failed_ticket_holds_source_until_quiesced(self):
+    def test_failed_ticket_holds_source_until_quiesced(self):
         ledger = SlotLedger(lambda layer: (0,))
         request = make_request()
         key = make_key(request)
@@ -629,7 +628,7 @@ class SlotLedgerTests(TestCase):
         with self.assertRaises(SlotError):
             ledger.wait(0, 0.05)  # conclusion still failed
 
-    def test_ut9_old_epoch_callback_does_not_release_new_generation(self):
+    def test_old_epoch_callback_does_not_release_new_generation(self):
         ledger = SlotLedger(lambda layer: (0,))
         request = make_request()
         key_a = make_key(request, op=0)
@@ -643,7 +642,7 @@ class SlotLedgerTests(TestCase):
         with self.assertRaises(TimeoutError):
             ledger.wait(0, 0.05)
 
-    def test_ut10_wait_blocks_until_sealed_even_with_zero_transfers(self):
+    def test_wait_blocks_until_sealed_even_with_zero_transfers(self):
         ledger = SlotLedger(lambda layer: (0,))
         ledger.register_batch(0, [], seal_immediately=False)  # zero-transfer batch, not yet sealed
         with self.assertRaises(TimeoutError):
@@ -651,7 +650,7 @@ class SlotLedgerTests(TestCase):
         ledger.seal(0)
         ledger.wait(0, 1.0)  # zero-transfer seal still releases the barrier
 
-    def test_ut11_two_requests_share_one_layer_first_completion_does_not_release(self):
+    def test_two_requests_share_one_layer_first_completion_does_not_release(self):
         ledger = SlotLedger(lambda layer: (0,))
         key_a = make_key(make_request(instance="req-a"))
         key_b = make_key(make_request(instance="req-b"))
@@ -663,8 +662,8 @@ class SlotLedgerTests(TestCase):
         ledger.complete(0, key_b, Status.SUCCESS, source_quiesced=True)
         ledger.wait(0, 1.0)  # both drained -> barrier opens
 
-    def test_ut22_three_slot_rotation_waits_old_occupant(self):
-        # 3 shared buffers, 27 layers (08 §9 #22): layer 3 enters while layer 0
+    def test_three_slot_rotation_waits_old_occupant(self):
+        # 3 shared buffers, 27 layers: layer 3 enters while layer 0
         # (same slot) still has in-flight tickets -> wait(3) must block. A naive
         # layer-keyed ledger would return immediately here.
         ledger = SlotLedger(lambda layer: (layer % 3,))
@@ -675,7 +674,7 @@ class SlotLedgerTests(TestCase):
         with self.assertRaises(TimeoutError):
             ledger.wait(3, 0.05)
 
-        # Branch 2 (D1): a waiter that snapshotted generation 1 returns once it
+        # Branch 2: a waiter that snapshotted generation 1 returns once it
         # fully ended, even though generation 2 (layer 3's own batch) is fresh
         # and pending — it must NOT chase the new generation.
         outcome = {}
