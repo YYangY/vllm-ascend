@@ -2588,7 +2588,6 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         )
 
     def test_committed_blocks_are_skipped_and_missing_blocks_allocated(self):
-
         worker = self._make_gva_worker()
         fresh_key = worker._make_layerwise_full_key(0, "h0")
         worker.m_store.batch_is_exist.side_effect = lambda keys: [0 if key == fresh_key else 1 for key in keys]

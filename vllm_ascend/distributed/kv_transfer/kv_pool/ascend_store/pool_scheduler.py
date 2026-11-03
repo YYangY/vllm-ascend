@@ -260,9 +260,7 @@ class KVPoolScheduler:
                 # Scheduler specs merge per-rank Indexer names and describe no
                 # physical allocation. Worker-local planners validate storage;
                 # the scheduler needs only the shared logical slot assignment.
-                self.layerwise_offload = build_layerwise_cache_layout(
-                    self.num_layers, reuse_config
-                ).has_layer_reuse
+                self.layerwise_offload = build_layerwise_cache_layout(self.num_layers, reuse_config).has_layer_reuse
         self.model_name = model_config.model.split("/")[-1]
 
         self.client: LookupKeyClient | None = None
