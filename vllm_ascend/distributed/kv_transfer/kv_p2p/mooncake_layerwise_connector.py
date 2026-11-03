@@ -10,6 +10,7 @@ import queue
 import struct
 import threading
 import time
+import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +57,26 @@ from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract import (
+    CONTRACT_VERSION,
+    BlockAllocation,
+    Component,
+    ContractError,
+    RequestKey,
+    Status,
+    TargetScope,
+    TokenRange,
+    TransferKey,
+    TransferResult,
+    assert_lease_consistent,
+    assert_provider_capabilities,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_receipt import (
+    ReceiptLedger,
+    SlotError,
+    SlotLedger,
+    is_no_compute_layer,
+)
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     PD_QOS_DEFAULT,
@@ -89,7 +110,18 @@ if TYPE_CHECKING:
 
 DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
+# Layerwise receipt protocol (v2 §6.2.2 / 08 §6): positional arrays decoded by
+# msgspec.Decoder(type=tuple), contract version at index 1. P emits one
+# LAYER_RESULT per (layer, component, chunk span) plus one RANK_TERMINAL per
+# request after the last layer (empty payloads included); D judges readiness
+# by identity instead of counting DONE messages.
+LAYER_RESULT_MSG = b"layer_result_msg"
+RANK_TERMINAL_MSG = b"rank_terminal_msg"
 LAYERWISE_REUSE_WAIT_LOG_INTERVAL_SECONDS = 10.0
+# Upper bound for the slot-ledger reuse wait (08 §7-⑥). The legacy event path
+# waits unbounded with a log heartbeat; the ledger path needs an explicit
+# deadline so a stalled transfer surfaces as an error instead of hanging.
+LAYERWISE_SLOT_WAIT_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass
@@ -128,6 +160,10 @@ class ReqMeta:
     local_computed_tokens: int = 0
     local_transed_tokens: int = 0
     do_virtual: bool = False
+    # Receipt mode (v2 §5.4): generated once by the D scheduler in
+    # update_state_after_alloc (ruling D5) and carried to P via
+    # kv_transfer_params. Empty for plain-mode requests.
+    request_instance: str = ""
 
 
 @dataclass
@@ -274,6 +310,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event = ready_event
         self.callback_func = callback_func
         self.reuse_completion_callback = reuse_completion_callback
+        # Receipt mode (08 §7-⑤): set by the worker for receipt-enabled engines.
+        self.layer_result_sender: Callable | None = None
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -320,7 +358,72 @@ class KVCacheSendingLayerThread(threading.Thread):
                             self.failed_reqs.discard(req_id)
             if self.reuse_completion_callback is not None:
                 self.reuse_completion_callback(send_task.layer_idx, error)
+            self._emit_layer_results(send_task, error)
             self.send_queue.task_done()
+
+    def _emit_layer_results(self, send_task: SendTask, error: str | None) -> None:
+        """Receipt protocol sender (08 §7-⑤): one LAYER_RESULT per (component,
+        chunk span) per request, plus RANK_TERMINAL after the last layer (empty
+        payloads included, v2 §5.7-4). Only receipt-mode requests (those
+        carrying request_instance) participate; plain mode keeps DONE-only."""
+        if self.layer_result_sender is None:
+            return
+        completion = {**send_task.send_request, **send_task.failed_requests}
+        if not completion:
+            return
+        is_last_layer = send_task.layer_idx == (self.total_layers - 1)
+        # Positional component mapping: tensor_group_idx[0] is the primary
+        # (MAIN) group, additional groups are INDEXER. This is structural
+        # ordering, never group-id equality (08 §4.2-2).
+        group_count = len(self.layer_metadata[send_task.layer_name].tensor_group_idx)
+        components = [Component.MAIN] + [Component.INDEXER] * (group_count - 1)
+        for req_id, req_meta in completion.items():
+            if not req_meta.request_instance:
+                continue
+            succeeded = error is None and req_id not in self.failed_reqs
+            status = Status.SUCCESS if succeeded else Status.FAILED
+            end_token = min(req_meta.local_computed_tokens or req_meta.prompt_len, req_meta.prompt_len)
+            start_token = min(req_meta.local_transed_tokens, end_token)
+            for component in components:
+                self.layer_result_sender(
+                    req_meta,
+                    (
+                        LAYER_RESULT_MSG,
+                        CONTRACT_VERSION,
+                        req_meta.request_instance,
+                        0,  # transfer_generation: bumped only on preempt/retry (D6); P learns it via the B3 manifest
+                        self.tp_rank,
+                        send_task.layer_idx,
+                        send_task.layer_idx,
+                        component.value,
+                        start_token,
+                        end_token,
+                        "",  # backing_id: D resolves from its own lease (v1 single-backing)
+                        0,
+                        status.value,
+                        # source quiesced = True once the send thread finished
+                        # processing the task: ALL source reads for this layer
+                        # are complete, for succeeded AND failed components.
+                        # v2 §5.5 wants failed sources held only when a retry
+                        # could re-read them; v1 has no retry path, so holding
+                        # a failed component's source would just stall the
+                        # slot until abort. If B3 adds a retry policy, switch
+                        # to per-component holds (failure keeps False).
+                        True,
+                    ),
+                )
+            if is_last_layer and req_meta.chunk_finish:
+                self.layer_result_sender(
+                    req_meta,
+                    (
+                        RANK_TERMINAL_MSG,
+                        CONTRACT_VERSION,
+                        req_meta.request_instance,
+                        0,
+                        self.tp_rank,
+                        status.value,
+                    ),
+                )
 
     def get_transfer_meta(
         self,
@@ -601,6 +704,17 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.task_tracker = dict[str, int]()
         self.ready_event = ready_event
         self.metadata = metadata
+        # Receipt-mode state (v2 §5/§6, 08 §7-④): one ReceiptLedger per
+        # in-flight request, published by the scheduler side after target
+        # acquisition. This receive thread is the sole ledger writer; keyed by
+        # request_instance (what P stamps into receipt messages).
+        self.ledger_by_req: dict[str, ReceiptLedger] = {}
+        self.instance_to_req: dict[str, str] = {}
+        # Request ids ever seen in receipt mode; kept for the request lifetime
+        # (not popped on publish) so a late versioned DONE after publish is
+        # recognized as normal instead of flagged as a mode mismatch.
+        self.receipt_mode_reqs: set[str] = set()
+        self.receipt_provider = None  # TargetProvider, set via the facade
 
     def get_and_clear_done_requests(self) -> set[str]:
         """
@@ -650,6 +764,128 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 self.task_tracker.pop(req_id)
                 self.done_requests.add(req_id)
 
+    def handle_layer_result(self, msg: tuple) -> None:
+        """LAYER_RESULT_MSG (08 §6.1): (type, version, instance, gen, rank,
+        layer, op_id, component, start, end, backing_id, backing_gen, status,
+        source_quiesced). Judged by identity in the ledger (08 §4.3)."""
+        try:
+            (
+                _,
+                version,
+                instance,
+                generation,
+                rank,
+                layer,
+                op_id,
+                component,
+                start,
+                end,
+                backing_id,
+                backing_gen,
+                status,
+                quiesced,
+            ) = msg
+        except Exception:
+            logger.error("Malformed LAYER_RESULT_MSG (expected 14 fields): %r", msg)
+            return
+        if version != CONTRACT_VERSION:
+            logger.error("LAYER_RESULT_MSG version mismatch: %s != %s", version, CONTRACT_VERSION)
+            return
+        with self.lock:
+            ledger = self.ledger_by_req.get(instance)
+        if ledger is None:
+            logger.debug("LAYER_RESULT for unknown instance %s (plain-mode or stale); dropped", instance)
+            return
+        # P does not know D's backing layout in v1 (manifest transport is a B3
+        # rendezvous item): an empty backing_id resolves to the ledger's own
+        # primary backing. Multi-backing layers need the manifest (09 待回填).
+        if not backing_id and component == Component.MAIN.value and ledger.main_backings:
+            backing_id = ledger.main_backings[0]
+        try:
+            key = TransferKey(
+                request=RequestKey(request_instance=instance, transfer_generation=generation),
+                rank=rank,
+                logical_layer=layer,
+                operation_id=op_id,
+                component=Component(component),
+                token_range=TokenRange(start=start, end=end),
+                target_scope=TargetScope(
+                    backing_id=backing_id,
+                    backing_generation=backing_gen,
+                    consumer_rank=None if component == Component.MAIN.value else rank,
+                ),
+            )
+            result = TransferResult(key=key, status=Status(status), source_quiesced=bool(quiesced))
+        except Exception as e:
+            logger.error("Invalid LAYER_RESULT_MSG fields for %s: %s (msg=%r)", instance, e, msg)
+            return
+        ledger.record(result)
+        self._maybe_publish(instance)
+
+    def handle_rank_terminal(self, msg: tuple) -> None:
+        """RANK_TERMINAL_MSG (08 §6.1): (type, version, instance, gen, rank,
+        status). Empty payloads must still terminal (v2 §5.7-4)."""
+        try:
+            (_, version, instance, generation, rank, status) = msg
+        except Exception:
+            logger.error("Malformed RANK_TERMINAL_MSG (expected 6 fields): %r", msg)
+            return
+        if version != CONTRACT_VERSION:
+            logger.error("RANK_TERMINAL_MSG version mismatch: %s != %s", version, CONTRACT_VERSION)
+            return
+        with self.lock:
+            ledger = self.ledger_by_req.get(instance)
+        if ledger is None:
+            logger.warning("RANK_TERMINAL for unknown instance %s; dropped", instance)
+            return
+        ledger.finish_rank(rank, Status(status))
+        self._maybe_publish(instance)
+
+    def _maybe_publish(self, instance: str) -> None:
+        """08 §4.8 visibility flow, run in the receive thread (sole writer):
+        data ready -> receipt(visible=False) -> A.prepare_decode -> normal
+        return -> mark visible -> done_requests. Any prepare_decode error means
+        never visible, never published (v2 §5.6; UT20)."""
+        with self.lock:
+            ledger = self.ledger_by_req.get(instance)
+            req_id = self.instance_to_req.get(instance)
+            if ledger is None or req_id is None or req_id in self.done_requests:
+                return
+        receipt = ledger.build_receipt()
+        if receipt is None:
+            return  # data conditions not met yet
+        provider = self.receipt_provider
+        lease = getattr(ledger, "lease", None)
+        if provider is not None and lease is not None:
+            try:
+                provider.prepare_decode(lease, receipt)
+            except Exception as e:
+                logger.error(
+                    "prepare_decode failed for instance %s (req %s); not publishing. error=%s", instance, req_id, e
+                )
+                return
+        for rank in sorted(ledger.expected_ranks):
+            ledger.mark_visible(rank)
+        receipt.visible = True
+        with self.lock:
+            # Keep receipt_mode_reqs (request-lifetime): late versioned DONE
+            # after publish must stay recognized as normal.
+            self.receipt_mode_reqs.add(req_id)
+            self.ledger_by_req.pop(instance, None)
+            self.instance_to_req.pop(instance, None)
+            self.done_requests.add(req_id)
+        logger.info("Receipt-mode request %s (instance=%s) published after prepare_decode", req_id, instance)
+
+    def forget_request(self, req_id: str) -> None:
+        """Drop all receipt-mode state for one request id — called on every
+        exit path (publish, failure, cancel, preempt) from get_finished."""
+        with self.lock:
+            stale = [i for i, r in self.instance_to_req.items() if r == req_id]
+            for instance in stale:
+                self.instance_to_req.pop(instance, None)
+                self.ledger_by_req.pop(instance, None)
+            self.receipt_mode_reqs.discard(req_id)
+
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         handshake_port = self.side_channel_port + self.tp_rank
@@ -684,12 +920,41 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         request_id = msg[1]
                         trans_count = msg[2]
                         side_channel_path = msg[3]
-                        self.update_done_task(request_id, trans_count, side_channel_path)
+                        if len(msg) >= 5 and msg[4] == CONTRACT_VERSION:
+                            # Receipt-mode request, marked by the version field
+                            # P appends for requests carrying request_instance.
+                            # Request-intrinsic fact: no dependency on when the
+                            # scheduler synced the ledger maps (08 §6.3). Plain
+                            # requests keep the 4-tuple and reach
+                            # update_done_task unchanged.
+                            if request_id in self.receipt_mode_reqs:
+                                logger.debug("Receipt-mode request %s: DONE ignored, ledger owns publish", request_id)
+                            else:
+                                # Diagnostic only, never gates: P has receipt
+                                # mode on but this engine has no ledger for the
+                                # request (mode mismatch across P/D, or the
+                                # sync was lost). Log loudly so the watchdog
+                                # turns it into a BOUNDED failure with a clear
+                                # cause instead of a silent hang.
+                                logger.error(
+                                    "Versioned DONE for request %s but no receipt-mode state on this engine "
+                                    "(check layerwise_receipt_mode on P and D, and ledger sync); "
+                                    "publish would hang until the watchdog bounds it",
+                                    request_id,
+                                )
+                        else:
+                            self.update_done_task(request_id, trans_count, side_channel_path)
                         sock.send_multipart((identity, b"", b"ACK"))
                     elif msg[0] == FAILED_SENDING_MSG:
                         request_id = msg[1]
                         logger.error("Got FAILED_SENDING_MSG for request. request_id=%s. ", msg[1])
                         self.update_failed_task(request_id)
+                        sock.send_multipart((identity, b"", b"ACK"))
+                    elif msg[0] == LAYER_RESULT_MSG:
+                        self.handle_layer_result(msg)
+                        sock.send_multipart((identity, b"", b"ACK"))
+                    elif msg[0] == RANK_TERMINAL_MSG:
+                        self.handle_rank_terminal(msg)
                         sock.send_multipart((identity, b"", b"ACK"))
                     else:
                         logger.error(
@@ -723,6 +988,7 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
         self.requests[request_id] = ReqMeta(
             token_ids=token_ids or [],
             local_block_ids=local_block_ids,
+            request_instance=kv_transfer_params.get("request_instance", ""),
             remote_block_ids=kv_transfer_params.get("remote_block_ids", []),
             remote_block_size=kv_transfer_params.get("remote_block_size", []),
             remote_engine_id=kv_transfer_params.get("remote_engine_id"),
@@ -755,6 +1021,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         self.is_producer = self._is_kv_producer
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self._connector_metadata = MooncakeLayerwiseConnectorMetadata()
+        self._target_provider = None
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MooncakeLayerwiseConnectorScheduler | None = MooncakeLayerwiseConnectorScheduler(
@@ -775,7 +1042,43 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+        result = self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+        self._sync_target_state_to_worker()
+        return result
+
+    def set_target_provider(self, provider) -> None:
+        """08 §7-⑩: the only capability-probe entry point. AscendMultiConnector
+        calls this (ruling D2); capability gaps abort startup (v2 §5.8)."""
+        assert_provider_capabilities(provider)
+        self._target_provider = provider
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.attach_target_provider(provider)
+        if self.connector_worker is not None:
+            self.connector_worker.attach_target_provider(provider)
+
+    def _sync_target_state_to_worker(self) -> None:
+        """Hand freshly published ledgers to the receive thread. In-process
+        fast path (ruling D2 v1); cross-process manifest transport is the B3
+        rendezvous item (v2 §9.1) and lands with A's runtime wiring."""
+        scheduler = self.connector_scheduler
+        worker = self.connector_worker
+        if scheduler is None or worker is None:
+            return
+        ledgers = getattr(scheduler, "_target_ledgers", None)
+        if not ledgers:
+            return
+        thread = worker.kv_recv_layer_thread
+        if thread is None:
+            return
+        with thread.lock:
+            thread.ledger_by_req.update(ledgers)
+            thread.instance_to_req.update(getattr(scheduler, "_instance_to_req", {}))
+            thread.receipt_mode_reqs.update(getattr(scheduler, "_instance_to_req", {}).values())
+        provider = getattr(worker, "_target_provider", None)
+        if provider is not None:
+            thread.receipt_provider = provider
+        scheduler._target_ledgers = {}
+        scheduler._instance_to_req = {}
 
     def build_connector_meta(
         self,
@@ -1030,9 +1333,15 @@ class MooncakeLayerwiseConnectorScheduler:
             # request_finished in the scheduler side except "request_id".
             # change the format of request_id if vllm-version >= 0.14.0
             external_req_id = get_external_request_id(request.request_id)
+            # 08 §7-② (ruling D5): request_instance is generated exactly once
+            # per request lifetime, in this do_remote_prefill branch (it runs
+            # once — params["do_remote_prefill"] flips to False below), and
+            # reaches P via kv_transfer_params, the only existing D->P channel.
+            request_instance = uuid.uuid4().hex
             kv_transfer_params = dict(
                 token_ids=[],
                 request_id=external_req_id,
+                request_instance=request_instance,
                 do_remote_prefill=False,
                 do_remote_decode=True,
                 remote_block_ids=remote_block_ids,
@@ -1056,6 +1365,10 @@ class MooncakeLayerwiseConnectorScheduler:
 
                 future.add_done_callback(handle_exception)
 
+                # 08 §7-②: publish the D-side target right after allocation
+                # (v2 §5.6): acquire -> validate -> ledger. No-op in plain mode.
+                self._maybe_publish_target(request, kv_transfer_params, local_block_ids)
+
         # Layerwise prefiller add request need send
         if params is not None and params.get("do_remote_decode"):
             local_block_ids = list(blocks.get_block_ids())
@@ -1071,6 +1384,68 @@ class MooncakeLayerwiseConnectorScheduler:
                 local_computed_tokens=local_computed_tokens,
                 request=request,
             )
+
+    def attach_target_provider(self, provider) -> None:
+        """08 §7-⑩ (scheduler role): store the provider and the per-request
+        target state published via _maybe_publish_target."""
+        assert_provider_capabilities(provider)
+        self._target_provider = provider
+        self._target_ledgers: dict[str, ReceiptLedger] = {}
+        self._instance_to_req: dict[str, str] = {}
+
+    def _maybe_publish_target(self, request: "Request", kv_transfer_params: dict, local_block_ids) -> None:
+        """08 §7-②: acquire the D-side target right after allocation (v2 §5.6)
+        and create the request's ReceiptLedger. Plain mode (no provider attached,
+        ruling D2) is a no-op. Contract failures fail this request loudly —
+        never half-published (v2 §5.8)."""
+        provider = getattr(self, "_target_provider", None)
+        if provider is None:
+            return
+        request_instance = kv_transfer_params.get("request_instance", "")
+        external_req_id = kv_transfer_params.get("request_id", "")
+        request_key = RequestKey(request_instance=request_instance, transfer_generation=0)
+        allocation = BlockAllocation(
+            request=request_key,
+            allocation_generation=0,
+            group_block_ids=tuple(tuple(group) for group in local_block_ids) or ((0,),),
+            manager_block_size_tokens=min(self.block_size),
+            prompt_tokens=max(len(request.prompt_token_ids), 1),
+        )
+        lease = provider.acquire_target(request_key, allocation)
+        assert_lease_consistent(lease, request_key)
+        # Startup-check leftovers that depend on the lease contents (08 §8):
+        # manager_block % page is enforced by CacheView.__post_init__; writer
+        # coverage is proven here before anything is published.
+        prompt_len = allocation.prompt_tokens
+        for backing, ranges in lease.writer_plan.ranges_by_backing.items():
+            covered = 0
+            for token_range in sorted(ranges, key=lambda r: r.start):
+                if token_range.start > covered:
+                    break
+                covered = max(covered, token_range.end)
+            if covered < prompt_len:
+                raise ContractError(
+                    f"writer coverage missing for backing {backing!r}: "
+                    f"union ends at {covered} < prompt {prompt_len}"
+                )
+        sender_ranks = kv_transfer_params.get("remote_tp_size") or self.vllm_config.parallel_config.tensor_parallel_size
+        ledger = ReceiptLedger(
+            request=request_key,
+            expected_ranks=tuple(range(sender_ranks)),
+            main_backings=backings,
+            indexer_ranks=tuple(range(sender_ranks)),
+            prompt_len=prompt_len,
+        )
+        ledger.lease = lease  # consumed by prepare_decode in the receive thread
+        self._target_ledgers[request_instance] = ledger
+        self._instance_to_req[request_instance] = external_req_id
+        logger.info(
+            "Published target for req %s (instance=%s, backings=%s, expected_senders=%d)",
+            external_req_id,
+            request_instance,
+            backings,
+            sender_ranks,
+        )
 
     def build_connector_meta(
         self,
@@ -1256,6 +1631,16 @@ class MooncakeLayerwiseConnectorWorker:
         self._storage_send_errors: dict[int, str] = {}
         self._pending_reuse_layers: set[int] = set()
         self._cache_write_events: list[torch.npu.Event | None] = [None] * self.total_layers
+        # Receipt-mode / reuse-ledger state (08 §7, rulings D1-D2). The slot
+        # ledger is created in _init_layerwise_reuse_state once the planner's
+        # layer->slot mapping exists.
+        self._slot_ledger: SlotLedger | None = None
+        self._slot_ledger_active = False
+        self._layer_keys: dict[int, tuple[TransferKey, ...]] = {}
+        self._compute_done_events: list[torch.npu.Event | None] = [None] * self.total_layers
+        self._no_compute_layers: set[int] = set()
+        self._target_provider = None
+        self._receipt_send_drops = 0  # receipt messages lost after retries (watchdog backstop)
 
         self.block_size: list[int] = [spec.block_size for spec in self.kv_cache_specs]
         self.kernel_block_size_scale: list[int] = [1 for _ in range(self.num_kv_cache_groups)]
@@ -1313,6 +1698,9 @@ class MooncakeLayerwiseConnectorWorker:
             event = threading.Event()
             event.set()
             self.storage_send_done_events.append(event)
+        # Ruling D1: the ledger is keyed by the same address-derived slot ids,
+        # sourced from the planner's mapping above — never re-derived by modulo.
+        self._slot_ledger = SlotLedger(lambda layer_idx: self.layer_storage_slots.get(layer_idx, ()))
 
     def _mark_layer_reuse_pending(self, layer_idx: int) -> None:
         if layer_idx not in self.layer_storage_slots:
@@ -1325,6 +1713,7 @@ class MooncakeLayerwiseConnectorWorker:
             self.storage_send_done_events[slot_id].clear()
 
     def _complete_layer_reuse(self, layer_idx: int, error: str | None) -> None:
+        self._complete_layer_tickets(layer_idx, error)
         if layer_idx not in self._pending_reuse_layers:
             return
         self._pending_reuse_layers.remove(layer_idx)
@@ -1339,6 +1728,18 @@ class MooncakeLayerwiseConnectorWorker:
             return
         if layer_idx not in self.layer_storage_slots:
             raise RuntimeError(f"Mooncake layerwise reuse mapping is missing layer {layer_idx}")
+        if self._slot_ledger is not None and self._slot_ledger_active:
+            # Ledger path (08 §7-⑥, ruling D1/C3): resolve the layer to its
+            # slots, snapshot the current generation per slot at entry, then
+            # apply the three-branch rule. SlotError (failed generation or
+            # protocol misuse) surfaces as RuntimeError; TimeoutError likewise.
+            try:
+                self._slot_ledger.wait(layer_idx, LAYERWISE_SLOT_WAIT_TIMEOUT_SECONDS)
+                return
+            except SlotError as slot_error:
+                raise RuntimeError(f"Mooncake layerwise slot reuse failed: {slot_error}") from slot_error
+            except TimeoutError as timeout_error:
+                raise RuntimeError(f"Mooncake layerwise slot reuse timed out: {timeout_error}") from timeout_error
         for slot_id in self.layer_storage_slots[layer_idx]:
             event = self.storage_send_done_events[slot_id]
             while not event.wait(timeout=LAYERWISE_REUSE_WAIT_LOG_INTERVAL_SECONDS):
@@ -1348,6 +1749,102 @@ class MooncakeLayerwiseConnectorWorker:
             error = self._storage_send_errors.get(slot_id)
             if error is not None:
                 raise RuntimeError(f"Mooncake failed to transfer physical KV slot {slot_id}: {error}")
+
+    def attach_target_provider(self, provider) -> None:
+        """08 §7-⑩: single capability-probe entry, called by
+        AscendMultiConnector (ruling D2). Raises on any capability gap -> the
+        engine never starts in a degraded mode (v2 §5.8)."""
+        assert_provider_capabilities(provider)
+        self._target_provider = provider
+        if self.kv_recv_layer_thread is not None:
+            self.kv_recv_layer_thread.receipt_provider = provider
+
+    def send_layer_result(self, req_meta: ReqMeta, msg: tuple) -> None:
+        """Best-effort receipt transport (08 §6.2): REQ/ACK with 3 retries,
+        copied from send_done_send_signal. Version mismatch fails before
+        sending. Failures are logged, not raised: the D-side watchdog bounds
+        the stall instead (08 §4.7)."""
+        if msg[1] != CONTRACT_VERSION:
+            raise RuntimeError(f"receipt protocol version mismatch: {msg[1]} != {CONTRACT_VERSION}")
+        if req_meta.remote_host is None or req_meta.remote_port is None:
+            logger.debug("Receipt message dropped: no remote endpoint for request yet")
+            return
+        path = make_zmq_path("tcp", req_meta.remote_host, req_meta.remote_port)
+        encoded = self.encoder.encode(msg)
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
+                    sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
+                    ensure_zmq_send(sock, encoded, f"{req_meta.remote_host}:{req_meta.remote_port}")
+                    if not sock.poll(int(self.timeout * 1000), zmq.POLLIN):  # type: ignore[attr-defined]
+                        raise TimeoutError(
+                            f"Timed out waiting for ACK from {req_meta.remote_host}:{req_meta.remote_port}"
+                        )
+                    ack = sock.recv()
+                    if ack != b"ACK":
+                        raise ValueError(f"Unexpected ACK response: {ack}")
+                    return
+            except Exception as e:
+                if attempt >= max_retries:
+                    self._receipt_send_drops += 1
+                    logger.error(
+                        "DROPPED receipt message type=%s for instance=%s after %d attempts "
+                        "(total drops=%d; D-side watchdog bounds the stall). error=%s",
+                        msg[0],
+                        msg[2],
+                        max_retries,
+                        self._receipt_send_drops,
+                        e,
+                    )
+
+    def _build_transfer_key(self, req_id: str, req_meta: ReqMeta, layer_idx: int) -> TransferKey:
+        """Slot-ledger ticket identity for one request's read of this layer.
+        On the P side the ledger tracks source readers only; the D-facing
+        component/backing detail lives in the wire messages instead."""
+        end_token = min(req_meta.local_computed_tokens or req_meta.prompt_len, req_meta.prompt_len)
+        start_token = min(req_meta.local_transed_tokens, end_token)
+        return TransferKey(
+            request=RequestKey(request_instance=req_meta.request_instance, transfer_generation=0),
+            rank=self.tp_rank,
+            logical_layer=layer_idx,
+            operation_id=layer_idx,
+            component=Component.MAIN,
+            token_range=TokenRange(start=start_token, end=end_token),
+            target_scope=TargetScope(backing_id="", backing_generation=0, consumer_rank=None),
+        )
+
+    def _complete_layer_tickets(self, layer_idx: int, error: str | None) -> None:
+        """Receipt mode (08 §7-⑤/⑥): finish the layer's registered slot
+        tickets. Success marks done+quiesced (source readers released); failure
+        keeps the source held (quiesced=False) per v2 §5.5 — the abort path
+        owns that request's cleanup."""
+        keys = self._layer_keys.pop(layer_idx, None)
+        ledger = self._slot_ledger
+        if ledger is None or not keys:
+            return
+        status = Status.FAILED if error else Status.SUCCESS
+        quiesced = error is None
+        for key in keys:
+            ledger.complete(layer_idx, key, status, source_quiesced=quiesced)
+
+    def _run_startup_validations(self) -> None:
+        """08 §8 fail-fast checks. Any failure aborts startup (v2 §5.8) —
+        never degrade silently."""
+        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        if pp_size != 1:
+            raise RuntimeError(f"Mooncake layerwise receipt mode requires PP=1, got PP={pp_size}")
+        if not self.index_to_name:
+            raise RuntimeError("Mooncake layerwise receipt mode found no physical layers to manage")
+        for layer_idx, layer_names in self.index_to_name.items():
+            if not layer_names:
+                raise RuntimeError(f"Mooncake layerwise mapping for layer {layer_idx} is empty")
+            for layer_name in layer_names:
+                if layer_name not in self.layer_metadata:
+                    raise RuntimeError(f"Mooncake layerwise metadata missing for layer {layer_name!r}")
+        # manager_block % page and writer coverage are enforced per request at
+        # publish time (CacheView.__post_init__ + writer-plan check in
+        # _maybe_publish_target) because they depend on A's lease contents.
 
     def create_kv_buffer(self, first_kv_cache_tuple):
         alignment = 2 * 1024 * 1024
@@ -1522,6 +2019,7 @@ class MooncakeLayerwiseConnectorWorker:
             self.total_layers = max(self.total_layers, max(self.index_to_name) + 1)
 
         self._init_layerwise_reuse_state()
+        self._run_startup_validations()
 
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
@@ -1554,6 +2052,7 @@ class MooncakeLayerwiseConnectorWorker:
                 reuse_completion_callback=self._complete_layer_reuse,
             )
             self.kv_send_layer_thread.start()
+            self.kv_send_layer_thread.layer_result_sender = self.send_layer_result
             ready_event.wait()
 
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
@@ -1594,6 +2093,11 @@ class MooncakeLayerwiseConnectorWorker:
             org_req_id = req_id[:-9]
             self.request_map.pop(org_req_id, None)
             self._recving_metadata.pop(req_id, None)
+            if self.kv_recv_layer_thread is not None:
+                # Clear receipt-mode state on EVERY exit path (done / failed /
+                # cancel / preempt) so a reused request id is never ignored by
+                # stale ledger or instance mappings.
+                self.kv_recv_layer_thread.forget_request(req_id)
         if len(done_recving) > 0:
             logger.info(
                 "Number of completed KV cache recv requests: %s, receive requests: %s", len(done_recving), done_recving
@@ -1910,6 +2414,22 @@ class MooncakeLayerwiseConnectorWorker:
             if cache_write_event is None:
                 cache_write_event = torch.npu.Event()
                 cache_write_event.record()
+            # 08 §7-⑧: compute-done event, recorded AFTER this hook returns so
+            # attention has finished reading. Semantically distinct from
+            # _cache_write_events (the scatter-time ready event handed to the
+            # transfer thread) — do not merge them. A layer whose requests were
+            # all fully prefix-hit has no compute reader (v2 §5.8): mark it
+            # no_compute_reader instead of recording an event. The predicate is
+            # pure stdlib (receipt module) so UT19 covers it on any box.
+            if is_no_compute_layer(
+                [r.local_computed_tokens for r in connector_metadata.requests.values()],
+                [r.prompt_len for r in connector_metadata.requests.values()],
+            ):
+                self._no_compute_layers.add(self.current_layer)
+            elif self.current_layer not in self._no_compute_layers:
+                compute_done_event = torch.npu.Event()
+                compute_done_event.record()
+                self._compute_done_events[self.current_layer] = compute_done_event
             send_task = connector_metadata.send_task
             layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
             keys = None
@@ -2030,6 +2550,26 @@ class MooncakeLayerwiseConnectorWorker:
                 len(req_meta.local_block_ids) > layer_group_idx and bool(req_meta.local_block_ids[layer_group_idx])
                 for req_meta in connector_metadata.requests.values()
             )
+            # 08 §7-⑦ (ruling D1): register the layer's whole batch — all
+            # requests — in one atomic register+seal, so a shared layer cannot
+            # release its slot on the first finished request. Receipt-mode
+            # requests only; plain-mode layers keep the legacy event path, and
+            # unregistered layers fall through to it as well.
+            if self._slot_ledger is not None and layer_send_task.send_request:
+                receipt_keys = tuple(
+                    self._build_transfer_key(req_id, req_meta, self.current_layer)
+                    for req_id, req_meta in layer_send_task.send_request.items()
+                    if req_meta.request_instance
+                )
+                if receipt_keys:
+                    try:
+                        self._slot_ledger.register_batch(self.current_layer, receipt_keys)
+                    except SlotError as slot_error:
+                        raise RuntimeError(
+                            f"Mooncake layerwise slot ledger rejected layer {self.current_layer}: {slot_error}"
+                        ) from slot_error
+                    self._layer_keys[self.current_layer] = receipt_keys
+                    self._slot_ledger_active = True
             if needs_reuse_gate:
                 # This must happen before AscendStore publishes StoreSaveDone.
                 # Otherwise its receiver may consume the previous set state
@@ -2138,9 +2678,23 @@ class MooncakeLayerwiseConnectorWorker:
             path = make_zmq_path("tcp", req_meta.remote_host, req_meta.remote_port)
             msg_encoder = msgspec.msgpack.Encoder()
             side_channel_path = f"{self.side_channel_host}:{self.handshake_port}"
-            encoded_data = msg_encoder.encode(
-                (send_msg_type, external_req_id, req_meta.trans_count[group_idx], side_channel_path)
-            )
+            if req_meta.request_instance:
+                # Receipt-mode request: version-tagged 5-tuple. Plain requests
+                # keep the 4-tuple, so a plain-mode D side reads it unchanged
+                # (the extra element is simply never looked at there).
+                encoded_data = msg_encoder.encode(
+                    (
+                        send_msg_type,
+                        external_req_id,
+                        req_meta.trans_count[group_idx],
+                        side_channel_path,
+                        CONTRACT_VERSION,
+                    )
+                )
+            else:
+                encoded_data = msg_encoder.encode(
+                    (send_msg_type, external_req_id, req_meta.trans_count[group_idx], side_channel_path)
+                )
             max_retries = 3
             for attempt in range(1, max_retries + 1):
                 try:

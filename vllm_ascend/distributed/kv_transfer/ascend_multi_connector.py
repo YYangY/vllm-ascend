@@ -39,6 +39,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             "HMA should not be enabled unless all sub-connectors support it"
         )
         self._configure_layerwise_reuse_completion()
+        self._configure_target_provider()
         self._mamba_copy_bufs = None
         # Handle to the (V2) mamba hybrid model state while its per-layer
         # align pre-copy is deferred behind a layerwise child connector.
@@ -97,6 +98,46 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     def _wait_for_external_slot_release(self, layer_idx: int) -> None:
         for provider in self._layerwise_slot_release_providers:
             provider.wait_for_layer_reuse(layer_idx)
+
+    @staticmethod
+    def _receipt_mode_requested(connector) -> bool:
+        """Layerwise receipt mode is opted in per engine via the kv-transfer
+        extra config key ``layerwise_receipt_mode`` (v2 §5.8 mode flag)."""
+        config = getattr(connector, "vllm_config", None)
+        kv_transfer = getattr(config, "kv_transfer_config", None) if config is not None else None
+        extra = getattr(kv_transfer, "kv_connector_extra_config", None) or {}
+        return bool(extra.get("layerwise_receipt_mode", False))
+
+    def _configure_target_provider(self) -> None:
+        """TargetProvider injection (ruling D2, 08 §7-⑪+). Three-way decision:
+        - mode off + no provider -> skip (legal, plain mode);
+        - mode on + no provider -> startup failure (v2 §5.8: no silent
+          degradation when the feature was requested);
+        - more than one provider -> startup failure (exactly one D-target store).
+        The discovered provider must pass the facade's capability probe, which
+        also aborts startup on any gap."""
+        providers = []
+        for connector in self._connectors:
+            worker = getattr(connector, "connector_worker", None)
+            for candidate in (connector, worker):
+                if candidate is not None and callable(getattr(candidate, "acquire_target", None)):
+                    providers.append(candidate)
+        if len(providers) > 1:
+            raise ValueError(f"Expected at most one TargetProvider, found {len(providers)}")
+        if not providers:
+            if any(self._receipt_mode_requested(connector) for connector in self._connectors):
+                raise ValueError(
+                    "layerwise_receipt_mode is enabled but no connector exposes a TargetProvider "
+                    "(acquire_target); refusing to start (v2 §5.8)"
+                )
+            return
+        for connector in self._connectors:
+            setter = getattr(connector, "set_target_provider", None)
+            if callable(setter):
+                setter(providers[0])
+                return
+        if any(self._receipt_mode_requested(connector) for connector in self._connectors):
+            raise ValueError("Found a TargetProvider but no connector accepts set_target_provider")
 
     def shutdown(self) -> None:
         # Release provider waits before joining the store's receive threads.
