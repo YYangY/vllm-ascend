@@ -93,6 +93,20 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             set_waiter = getattr(connector, "set_external_slot_release_waiter", None)
             if callable(set_waiter) and set_waiter(self._wait_for_external_slot_release) is not False:
                 self._external_slot_release_sink_configured = True
+        self._configure_reuse_source_contract()
+
+    def _configure_reuse_source_contract(self) -> None:
+        providers = [
+            p for p in self._layerwise_slot_release_providers if getattr(p, "reuse_source_contract_version", None) == 1
+        ]
+        if not providers:
+            return
+        if len(providers) != 1:
+            raise RuntimeError("Reuse source contract v1 requires exactly one transport consumer")
+        sinks = [c for c in self._connectors if callable(getattr(c, "set_reuse_source_consumer", None))]
+        if len(sinks) != 1 or not self._external_slot_release_sink_configured:
+            raise RuntimeError("Reuse source contract requires one wired Store sink")
+        sinks[0].set_reuse_source_consumer(providers[0])
 
     def _wait_for_external_slot_release(self, layer_idx: int) -> None:
         for provider in self._layerwise_slot_release_providers:

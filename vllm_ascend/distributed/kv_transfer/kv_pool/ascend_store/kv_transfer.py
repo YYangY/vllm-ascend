@@ -2149,6 +2149,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     return
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            if data.before_slot_write is not None:
+                data.before_slot_write()
             for task in data.transfer_tasks:
                 shared = task.shared_block_data
                 if shared is None:
@@ -2163,6 +2165,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self._group_load_indices[task.group_id] = None if task.final_group_layer else self._active_load_indices
         except Exception as exc:
             self._fatal_error = exc
+            if data.slot_write_failed is not None:
+                try:
+                    data.slot_write_failed(exc)
+                except Exception:
+                    logger.exception("Source consumer failed to acknowledge a load failure")
             if self._active_load_indices is not None:
                 self._active_load_indices.clear()
             self._mark_invalid_transfer_task_blocks(data.transfer_tasks)
@@ -2200,6 +2207,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self._mark_failed_requests([br.request for task in data.transfer_tasks for br in task.block_ranges])
         except Exception as exc:
             self._fatal_error = exc
+            if data.slot_write_failed is not None:
+                data.slot_write_failed(exc)
             raise
         finally:
             self.layer_load_finished_events[data.layer_id].set()
@@ -2230,6 +2239,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if not self._wait_for_event(data.previous_compute_done, self.save_failure_checker):
                 raise RuntimeError("Receiver stopped before previous attention completed")
         if self.load_disabled.is_set():
+            if data.before_slot_write is not None:
+                raise RuntimeError("Refusing to open a source epoch after a failed load")
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
             return False
@@ -2237,6 +2248,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if len(transfer_tasks) == 0:
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            if data.before_slot_write is not None:
+                data.before_slot_write()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug("Layer load event set: layer %d", layer_id)
             return True
@@ -2262,6 +2275,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if not task_metas:
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            if data.before_slot_write is not None:
+                data.before_slot_write()
             assert not self.layer_load_finished_events[layer_id].is_set()
             logger.debug("Layer load event set: layer %d", layer_id)
             return True
@@ -2290,6 +2305,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
         if self.external_slot_release_waiter is not None:
             self.external_slot_release_waiter(layer_id)
+        if data.before_slot_write is not None:
+            data.before_slot_write()
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,

@@ -1392,6 +1392,8 @@ class LayerLoadTask:
     layer_id: int
     attention_start_gate: AttentionComputeStartGate | None = None
     previous_compute_done: AttentionComputeCompletion | None = None
+    before_slot_write: Callable[[], None] | None = None
+    slot_write_failed: Callable[[Exception], None] | None = None
 
 
 @dataclass(init=False)

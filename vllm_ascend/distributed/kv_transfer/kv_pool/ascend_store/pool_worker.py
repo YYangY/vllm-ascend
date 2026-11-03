@@ -103,6 +103,12 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.reuse_source import (
+    RequestSource,
+    ReuseSourceRegistry,
+    SourceConsumer,
+    SourceView,
+)
 from vllm_ascend.distributed.kv_transfer.load_failure_registry import (
     record_failed_load,
 )
@@ -477,6 +483,9 @@ class KVPoolWorker:
         self.kv_recv_thread: KVTransferThread | None = None
         self._previous_save_batch: KVCacheStoreBatch | None = None
         self._transfer_threads_started = False
+        self._reuse_source_consumer: SourceConsumer | None = None
+        self._reuse_source_registry: ReuseSourceRegistry | None = None
+        self._reuse_source_requests: tuple[RequestSource, ...] = ()
         self.external_slot_release_waiter: Callable[[int], None] | None = None
         self._put_started_keys: set[str] = set()
         self._put_started_keys_lock = threading.Lock()
@@ -759,6 +768,7 @@ class KVPoolWorker:
         for thread in threads:
             if thread.is_alive():
                 thread.join()
+        self.drain_reuse_sources()
         try:
             if self._step_load_keys:
                 result = self.m_store.batch_remove_lease(list(self._step_load_keys))
@@ -787,6 +797,101 @@ class KVPoolWorker:
         if isinstance(self.kv_recv_thread, KVCacheStoreLayerRecvingThread):
             self.kv_recv_thread.external_slot_release_waiter = waiter
         return True
+
+    def set_reuse_source_consumer(self, consumer: SourceConsumer) -> None:
+        """Install the new source contract before KV registration, never mid-flight."""
+        if self._transfer_threads_started:
+            raise RuntimeError("Install the source consumer before KV registration")
+        for name in ("open_source", "source_ready", "seal_source", "wait_source", "abort_source"):
+            if not callable(getattr(consumer, name, None)):
+                raise TypeError(f"Source consumer is missing {name}")
+        self._reuse_source_consumer = consumer
+
+    def _register_reuse_source_views(self) -> None:
+        consumer = getattr(self, "_reuse_source_consumer", None)
+        if consumer is None:
+            return
+        if not self._main_buffer_layer_slots or self._layerwise_reuse_layout is None:
+            raise RuntimeError("Source consumer requires the supported Main reuse layout")
+        views = {}
+        for layer, specs in self._layerwise_reuse_layout.layer_cache_specs.items():
+            local_layer = self._global_to_local_layer[layer]
+            entries = []
+            for component, named in (("MAIN", specs.main), ("INDEXER", specs.indexer)):
+                if named is None:
+                    continue
+                group = next(
+                    i for i, g in enumerate(self.kv_cache_config.kv_cache_groups) if named.layer_name in g.layer_names
+                )
+                for entry, cache in enumerate(self._as_cache_tuple(self.kv_caches[named.layer_name])):
+                    _, _, span, scale = self._get_cache_block_metadata(cache)
+                    if named.spec.block_size % scale:
+                        raise ValueError("Manager block must contain integral physical pages")
+                    slot = (
+                        f"main:{self._main_buffer_layer_slots[local_layer]}"
+                        if component == "MAIN"
+                        else f"indexer:{self._get_storage_key(cache)}"
+                    )
+                    entries.append(
+                        SourceView(
+                            local_layer,
+                            component,
+                            group,
+                            slot,
+                            cache.data_ptr(),
+                            span,
+                            tuple(cache.shape),
+                            tuple(x * cache.element_size() for x in cache.stride()),
+                            str(cache.dtype),
+                            named.spec.block_size,
+                            named.spec.block_size // scale,
+                            entry,
+                        )
+                    )
+            views[local_layer] = tuple(entries)
+        self._reuse_source_registry = ReuseSourceRegistry(views, consumer)
+
+    def abort_reuse_sources(self, error: Exception) -> None:
+        registry = getattr(self, "_reuse_source_registry", None)
+        if registry is not None:
+            registry.fail(error)
+
+    def drain_reuse_sources(self) -> None:
+        """Do not release source allocations before external readers quiesce."""
+        registry = getattr(self, "_reuse_source_registry", None)
+        if registry is not None:
+            registry.drain()
+
+    def _publish_reuse_source(self, layer: int) -> None:
+        registry = getattr(self, "_reuse_source_registry", None)
+        if registry is not None:
+            ready = torch.npu.Event()
+            ready.record()
+            registry.publish(layer, self._reuse_source_requests, ready)
+
+    def restore_kv_for_transfer(self, metadata: AscendConnectorMetadata) -> None:
+        """Explicit restore-only entry, after target admission, without model hooks.
+
+        Caller must not also bind/run a normal forward for this metadata. Every
+        token to be published must be covered by the Store restore plan. This
+        does not infer a scheduler decision or mark D requests complete.
+        """
+        if getattr(self, "_reuse_source_registry", None) is None:
+            raise RuntimeError("Restore-only transfer requires a registered source consumer")
+        for request in metadata.requests:
+            if not request.request_instance or request.restore_end_token != request.token_len_chunk:
+                raise ValueError("Restore-only requires the entire valid source range, with no new tokens")
+        self.drain_reuse_sources()
+        self.prepare_layerwise_step(metadata)
+        for _ in range(self.num_layers):
+            self.wait_for_layer_load()
+            # No attention read exists. Record KV-ready and the post-restore
+            # completion on the current stream; never forge device completion.
+            get_attention_compute_start_gate().record()
+            if self.current_layer not in self._attention_saved_layers:
+                self._submit_attention_save(self.current_layer)
+            self.save_kv_layer(metadata)
+        self.drain_reuse_sources()
 
     def assert_reuse_wired(self) -> None:
         """Refuse Main reuse without a real Store-side external release sink."""
@@ -1391,11 +1496,13 @@ class KVPoolWorker:
         self.m_store.register_buffer(ptrs, lengths)
         if self.use_block_key_layerwise:
             self.m_store.validate_layerwise_support()
+        self._register_reuse_source_views()
         self._start_kv_transfer_threads()
 
     def prepare_layerwise_step(self, metadata: AscendConnectorMetadata) -> None:
         """Prepare per-step hook state when the runner binds metadata."""
         assert self.use_layerwise
+        self.drain_reuse_sources()
         self._drain_deferred_last_save()
         # The final-layer fence drains this rank only. Readers of replicated
         # KV must also wait for the writer before querying the previous step.
@@ -1420,6 +1527,17 @@ class KVPoolWorker:
         self._save_disabled.clear()
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.load_disabled.clear()
+        if getattr(self, "_reuse_source_registry", None) is not None:
+            self._reuse_source_requests = tuple(
+                RequestSource(
+                    r.req_id,
+                    r.request_instance or "",
+                    0,
+                    r.token_len_chunk,
+                    tuple(tuple(ids) for ids in r.block_ids_by_group),
+                )
+                for r in metadata.requests
+            )
         self.process_layer_data(metadata.requests)
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
@@ -3389,6 +3507,7 @@ class KVPoolWorker:
         sync_save_events = self.sync_save_events
         save_finished_events = self.layer_save_finished_events
         send_thread = self.kv_send_thread
+        self._publish_reuse_source(layer_id)
         self._attention_saved_layers.add(layer_id)
         sync_save_events[layer_id].record()
         tasks = self.layer_save_tasks[layer_id]
@@ -3482,6 +3601,12 @@ class KVPoolWorker:
                     layer_id=layer_id,
                     attention_start_gate=attention_start_gate,
                     previous_compute_done=previous_compute_done,
+                    slot_write_failed=self.abort_reuse_sources,
+                    before_slot_write=(
+                        (lambda layer=layer_id: self._reuse_source_registry.begin_write(layer))
+                        if getattr(self, "_reuse_source_registry", None) is not None
+                        else None
+                    ),
                 )
             )
             return True
@@ -3575,6 +3700,7 @@ class KVPoolWorker:
             # submitted by the attention start gate on hybrid block-key paths.
             self._main_layer_compute_done[self.current_layer].record()
         if self.current_layer not in self._attention_saved_layers:
+            self._publish_reuse_source(self.current_layer)
             self.sync_save_events[self.current_layer].record()
             if self.layer_save_tasks[self.current_layer]:
                 for task in self.layer_save_tasks[self.current_layer]:
