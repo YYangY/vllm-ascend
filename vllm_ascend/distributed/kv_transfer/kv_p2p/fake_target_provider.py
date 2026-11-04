@@ -1,6 +1,6 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
-"""Test double for the store-side ``TargetProvider``.
+"""Test double for the target-side ``TargetProvider``.
 
 Same interface as the production implementation, pure stdlib, referenced only
 by unit tests and the contract tests. Production code must never import this

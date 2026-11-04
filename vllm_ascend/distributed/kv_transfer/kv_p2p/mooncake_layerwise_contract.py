@@ -1,14 +1,14 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
-"""Layerwise PD transfer contract shared between the connector side and the store side.
+"""Layerwise PD transfer contract shared between the connector side and the target side.
 
 Owner: the connector side (sole naming & maintenance authority); consumed by
-the store side to implement ``TargetProvider``. This file is the interface
+the target side to implement ``TargetProvider``. This file is the interface
 authority for the layerwise PD transfer.
 - ``get_target_views`` returns a flat ``tuple[CacheView, ...]``;
   consumers group by ``CacheView.component`` themselves.
 - ``release_target(lease) -> None``; its normal return is the provider's
-  promise that store-side references (physical pool + write-back) are already
+  promise that target-side references (physical pool + write-back) are already
   dropped.
 Hard rule: pure stdlib. No torch / torch_npu / zmq / vllm / msgspec imports, so
 this module (and its unit tests) run in CPU-only CI.
@@ -383,9 +383,9 @@ class TransferResult:
 
 @runtime_checkable
 class TargetProvider(Protocol):
-    """Store-side provider interface.
+    """Provider interface for the D-side target runtime.
 
-    Implemented on the store-side connector worker; the connector discovers the object,
+    Implemented on the D-side connector worker; the connector discovers the object,
     checks capabilities at startup, and calls it per request.
     """
 
@@ -410,7 +410,7 @@ class TargetProvider(Protocol):
         ...
 
     def release_target(self, lease: TargetLease) -> None:
-        """Initiate release. Normal return is the provider's promise that store-side
+        """Initiate release. Normal return is the provider's promise that target-side
         references (physical pool refs + write-back readers) are already
         dropped; the connector derives the scheduler-facing ReleaseAck from this promise
         plus its own DMA quiescence. Raise if unsafe to release."""
