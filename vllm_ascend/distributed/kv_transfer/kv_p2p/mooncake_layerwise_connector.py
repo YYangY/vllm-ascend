@@ -62,6 +62,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     BlockAllocation,
     Component,
     ContractError,
+    ReleaseAck,
     RequestKey,
     Status,
     TargetScope,
@@ -122,6 +123,10 @@ LAYERWISE_REUSE_WAIT_LOG_INTERVAL_SECONDS = 10.0
 # waits unbounded with a log heartbeat; the ledger path needs an explicit
 # deadline so a stalled transfer surfaces as an error instead of hanging.
 LAYERWISE_SLOT_WAIT_TIMEOUT_SECONDS = 300.0
+# Receipt watchdog (B5): a receipt-mode request whose ledger was installed
+# but never published within this deadline fails loudly through the
+# bounded-failure channel instead of hanging forever.
+RECEIPT_WATCHDOG_SECONDS = 300.0
 
 
 @dataclass
@@ -728,6 +733,9 @@ class KVCacheRecvingLayerThread(threading.Thread):
         # recognized as normal instead of flagged as a mode mismatch.
         self.receipt_mode_reqs: set[str] = set()
         self.receipt_provider = None  # TargetProvider, set via the facade
+        # instance -> monotonic publish deadline, set at ledger install and
+        # swept once per second by the receive-thread loop (B5 watchdog).
+        self.receipt_deadlines: dict[str, float] = {}
 
     def get_and_clear_done_requests(self) -> set[str]:
         """
@@ -894,6 +902,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
             )
             with self.lock:
                 self.failed_requests.add(req_id)
+                self.receipt_deadlines.pop(instance, None)
             return
         try:
             provider.prepare_decode(lease, receipt)
@@ -911,6 +920,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
             self.receipt_mode_reqs.add(req_id)
             self.ledger_by_req.pop(instance, None)
             self.instance_to_req.pop(instance, None)
+            self.receipt_deadlines.pop(instance, None)
             self.done_requests.add(req_id)
         logger.info("Receipt-mode request %s (instance=%s) published after prepare_decode", req_id, instance)
 
@@ -922,7 +932,32 @@ class KVCacheRecvingLayerThread(threading.Thread):
             for instance in stale:
                 self.instance_to_req.pop(instance, None)
                 self.ledger_by_req.pop(instance, None)
+                self.receipt_deadlines.pop(instance, None)
             self.receipt_mode_reqs.discard(req_id)
+
+    def _sweep_receipt_deadlines(self) -> None:
+        """Bounded-failure watchdog sweep (B5): fail receipt requests whose
+        ledger was installed but never published within the deadline. Late
+        messages after a sweep are dropped by the unknown-instance path."""
+        now = time.monotonic()
+        expired: list[tuple[str, str]] = []
+        with self.lock:
+            for instance, deadline in self.receipt_deadlines.items():
+                req_id = self.instance_to_req.get(instance)
+                if now >= deadline and req_id is not None:
+                    expired.append((instance, req_id))
+            for instance, req_id in expired:
+                self.ledger_by_req.pop(instance, None)
+                self.instance_to_req.pop(instance, None)
+                self.receipt_deadlines.pop(instance, None)
+                self.failed_requests.add(req_id)
+        for instance, req_id in expired:
+            logger.error(
+                "Receipt watchdog: request %s (instance=%s) did not publish within %.0fs; failing bounded",
+                req_id,
+                instance,
+                RECEIPT_WATCHDOG_SECONDS,
+            )
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -934,8 +969,15 @@ class KVCacheRecvingLayerThread(threading.Thread):
         with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
             self.ready_event.set()
             decoder = msgspec.msgpack.Decoder(type=tuple)
+            poller = zmq.Poller()
+            poller.register(sock, zmq.POLLIN)
             while True:
                 try:
+                    # A 1s poll keeps the receipt-watchdog sweep running even
+                    # when P goes completely silent.
+                    if not dict(poller.poll(timeout=1000)):
+                        self._sweep_receipt_deadlines()
+                        continue
                     frames = sock.recv_multipart()
                     if len(frames) < 2:
                         logger.error(
@@ -1000,6 +1042,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             msg[0] if msg else "empty",
                             msg,
                         )
+                    self._sweep_receipt_deadlines()
                 except Exception as e:
                     logger.error(
                         "Failed to decode message. type=%s, error=%s. context=decoding payload", type(e).__name__, e
@@ -1125,6 +1168,21 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def update_state_before_preempt(self, request: "Request"):
+        """Preempt notification only. Receipt-mode retention stays: the
+        request may resume, so the target lease and the scheduler retention
+        record are kept and blocks must not return to the pool here."""
+        scheduler = self.connector_scheduler
+        if scheduler is None:
+            return
+        instance = (request.kv_transfer_params or {}).get("request_instance")
+        if instance:
+            logger.info(
+                "Receipt-mode request %s preempted (instance=%s); target lease and retention kept",
+                request.request_id,
+                instance,
+            )
 
     def set_target_provider(self, provider) -> None:
         """The only capability-probe entry point. AscendMultiConnector
@@ -1748,9 +1806,26 @@ class MooncakeLayerwiseConnectorScheduler:
             )
             return False
         leases.pop(instance, None)
-        # The scheduler retention record is retired through the ReleaseAck
-        # aggregation path (registry.retire), not here: local release alone
-        # never authorizes returning blocks to the free pool.
+        # ReleaseAck aggregation (v1 premise): the receipt chain gated decode
+        # on per-rank/per-layer terminal SUCCESS, and the owner release above
+        # waited for compute/writeback quiescence — finishing the request
+        # therefore certifies the safe-release acknowledgement. Retiring the
+        # retention record authorizes the scheduler's existing free path to
+        # reclaim the blocks.
+        registry = getattr(self, "_retention_registry", None)
+        if registry is not None:
+            try:
+                registry.retire(
+                    lease.allocation,
+                    ReleaseAck(safe_to_release=True, retention_token=lease.allocation.retention_token),
+                )
+            except Exception as e:
+                logger.error(
+                    "retire failed for %s (instance=%s): %s -- blocks stay retained; bounded failure follows",
+                    request.request_id,
+                    instance,
+                    e,
+                )
         logger.info("Released target for %s (instance=%s)", request.request_id, instance)
         return True
 
@@ -2523,6 +2598,7 @@ class MooncakeLayerwiseConnectorWorker:
                 thread.ledger_by_req[instance] = ledger
                 thread.instance_to_req[instance] = external_req_id
                 thread.receipt_mode_reqs.add(external_req_id)
+                thread.receipt_deadlines[instance] = time.monotonic() + RECEIPT_WATCHDOG_SECONDS
             logger.debug(
                 "Installed receipt ledger for req %s (instance=%s, expected=%s)", req_id, instance, expected_ranks
             )
