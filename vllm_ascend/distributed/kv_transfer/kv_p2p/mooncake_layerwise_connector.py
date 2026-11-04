@@ -70,6 +70,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_contract impo
     TransferKey,
     TransferResult,
     assert_lease_consistent,
+    assert_pd_consistent,
     assert_provider_capabilities,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_receipt import (
@@ -1732,6 +1733,18 @@ class MooncakeLayerwiseConnectorScheduler:
         allocation = registry.issue(request.request_id, allocation)
         lease = provider.acquire_target(request_key, allocation)
         assert_lease_consistent(lease, request_key)
+        # P/D consistency: the producer must cover every writer rank the lease
+        # assigns, Main must be BF16 (an INT8 producer Main cannot splice into
+        # the BF16 D Host pool), and v1 requires one region per backing. The
+        # producer TP comes from the lease's sender ranks; the block sizes and
+        # Main dtype are the D catalog's own, which the lease views mirror.
+        sender_ranks = kv_transfer_params.get("remote_tp_size") or self.vllm_config.parallel_config.tensor_parallel_size
+        assert_pd_consistent(
+            lease,
+            producer_tp_size=sender_ranks,
+            producer_block_sizes=tuple(self.block_size),
+            producer_main_dtype="bfloat16",
+        )
         # Startup-check leftovers that depend on the lease contents:
         # manager_block % page is enforced by CacheView.__post_init__; writer
         # coverage is proven here before anything is published.
@@ -1758,7 +1771,6 @@ class MooncakeLayerwiseConnectorScheduler:
                 if region.region_id == view.region_binding
             )
         )
-        sender_ranks = kv_transfer_params.get("remote_tp_size") or self.vllm_config.parallel_config.tensor_parallel_size
         # Ledger construction happens on the WORKER side (the receive thread is
         # its sole writer); the scheduler ships a plain-data spec through
         # connector metadata, which vLLM serializes across processes.

@@ -475,6 +475,65 @@ def assert_lease_consistent(lease: TargetLease, request: RequestKey) -> None:
             )
 
 
+def assert_pd_consistent(
+    lease: TargetLease,
+    *,
+    producer_tp_size: int,
+    producer_block_sizes: tuple[int, ...],
+    producer_main_dtype: str,
+) -> None:
+    """Startup-time P/D consistency gate for a receipt-mode target lease.
+
+    The D-side catalog already validates single-end geometry (manager block %
+    page, one backing one region, BF16 Main). This gate checks the producer
+    side against the lease the scheduler carried over, so a P/D mismatch fails
+    fast at the first request rather than corrupting a transfer mid-stream:
+
+    - TP: every writer rank the lease assigns must exist on the producer.
+    - block size: each Main view's manager block must equal the producer's
+      matching block size (v1 requires exact equality, not just divisibility,
+      because the writer plan assumes the same page granularity).
+    - BF16 Main: a Main view whose dtype is not bfloat16 is rejected. The D
+      Host Main pool is BF16-only; an INT8 producer Main cannot splice into it.
+    - one backing one region (v1): no backing may own more than one region.
+
+    The v1 restrictions (single backing, fixed transfer generation 0, no
+    retry, TP-only) are enforced here as explicit checks, not relied on by
+    omission.
+    """
+    if not isinstance(producer_tp_size, int) or producer_tp_size < 1:
+        raise ContractError(f"producer_tp_size must be a positive int, got {producer_tp_size!r}")
+    for backing, ranks in lease.writer_plan.writers_by_backing.items():
+        if not ranks:
+            raise ContractError(f"writer plan backing {backing!r} has no writer ranks")
+        unknown = [rank for rank in ranks if rank < 0 or rank >= producer_tp_size]
+        if unknown:
+            raise ContractError(
+                f"writer plan assigns ranks {unknown} to backing {backing!r} but producer tp_size={producer_tp_size}"
+            )
+    backing_regions: dict[str, int] = {}
+    for region in lease.regions:
+        backing_regions[region.backing_id] = backing_regions.get(region.backing_id, 0) + 1
+    multi = {backing: count for backing, count in backing_regions.items() if count > 1}
+    if multi:
+        raise ContractError(f"v1 requires one region per backing; backings with multiple regions: {multi}")
+    main_views = [view for view in lease.views if view.component is Component.MAIN]
+    if not main_views:
+        raise ContractError("lease has no MAIN view; receipt v1 requires a Main backing")
+    producer_block_set = set(producer_block_sizes)
+    for view in main_views:
+        if view.dtype != "bfloat16" and view.dtype not in ("torch.bfloat16",):
+            raise ContractError(
+                f"MAIN view dtype {view.dtype!r} is not BF16; an INT8 producer Main cannot splice "
+                "into the BF16 D Host Main pool"
+            )
+        if view.manager_block_size_tokens not in producer_block_set:
+            raise ContractError(
+                f"MAIN view manager_block_size_tokens={view.manager_block_size_tokens} does not match "
+                f"any producer block size {sorted(producer_block_set)}"
+            )
+
+
 __all__ = [
     "CONTRACT_VERSION",
     "VISIBILITY_CONTRACT",
@@ -496,5 +555,6 @@ __all__ = [
     "TransferResult",
     "WriterPlan",
     "assert_lease_consistent",
+    "assert_pd_consistent",
     "assert_provider_capabilities",
 ]
