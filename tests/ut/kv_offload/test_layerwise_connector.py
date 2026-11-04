@@ -22,7 +22,7 @@ def _encode_decode(msg):
     return decoder.decode(encoder.encode(msg))
 
 
-class WireFormatTests:
+class TestWireFormat:
     """Positional arrays only; the decoder is Decoder(type=tuple),
     so a map-encoded message must fail loudly, never silently mis-bind."""
 
@@ -58,7 +58,7 @@ class WireFormatTests:
             decoder.decode(encoder.encode({"type": lc.LAYER_RESULT_MSG, "version": lc.CONTRACT_VERSION}))
 
 
-class ReceiptHandlerTests:
+class TestReceiptHandler:
     """Drive the receive-thread handlers directly (no zmq): malformed frames
     are logged and dropped, version mismatches never reach the ledger."""
 
@@ -93,7 +93,7 @@ class ReceiptHandlerTests:
         assert not thread.done_requests
 
 
-class PrefixHitNoComputeTests:
+class TestPrefixHitNoCompute:
     """Prefix-hit a layer whose requests are all fully prefix-hit has
     no compute reader — it must be marked no_compute_reader and must not hang
     the send path waiting on a compute-done event that will never come."""

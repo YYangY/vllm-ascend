@@ -341,6 +341,66 @@ class ReceiptConflictAndIdentity(TestCase):
         self.assertTrue(ledger.should_publish())  # new-instance data publishes normally
 
 
+class RequiredPlanAndFailureGates(TestCase):
+    """Plan-aware coverage and failure blocking: a layer outside the required
+    plan cannot hide inside the union, and a FAILED scope keeps readiness
+    False even after an overlapping success (v1 has no retry policy)."""
+
+    def _plan_ledger(self, request: RequestKey, *, layers=(0, 1)) -> ReceiptLedger:
+        return ReceiptLedger(
+            request=request,
+            expected_ranks=EXPECTED,
+            main_backings=BACKINGS,
+            indexer_ranks=INDEXER_RANKS,
+            prompt_len=PROMPT,
+            required_layers=layers,
+            indexer_backings=("ib0",),
+        )
+
+    def _feed_layer(self, ledger: ReceiptLedger, request: RequestKey, layer: int) -> None:
+        for start, end in ((0, 4), (4, 8)):
+            ledger.record(make_result(make_key(request, layer=layer, start=start, end=end)))
+            for rank in INDEXER_RANKS:
+                ledger.record(
+                    make_result(
+                        make_key(
+                            request,
+                            rank=rank,
+                            layer=layer,
+                            start=start,
+                            end=end,
+                            component=Component.INDEXER,
+                            consumer=rank,
+                        )
+                    )
+                )
+
+    def test_missing_required_layer_blocks_ready(self):
+        request = make_request()
+        ledger = self._plan_ledger(request)
+        self._feed_layer(ledger, request, 0)
+        for rank in EXPECTED:
+            ledger.finish_rank(rank, Status.SUCCESS)
+        self.assertFalse(ledger._data_ready())
+        self._feed_layer(ledger, request, 1)
+        self.assertTrue(ledger._data_ready())
+
+    def test_failed_scope_blocks_ready_even_after_overlapping_success(self):
+        request = make_request()
+        ledger = self._plan_ledger(request, layers=(0,))
+        ledger.record(make_result(make_key(request, layer=0, op=1), status=Status.FAILED))
+        ledger.record(make_result(make_key(request, layer=0, op=2)))
+        self.assertFalse(ledger._data_ready())
+        self.assertIn(("main:b0", 0), ledger._failed_scopes)
+
+    def test_out_of_plan_layer_counts_invalid(self):
+        request = make_request()
+        ledger = self._plan_ledger(request, layers=(0,))
+        ledger.record(make_result(make_key(request, layer=7)))
+        self.assertEqual(ledger._invalid_results, 1)
+        self.assertFalse(ledger._data_ready())
+
+
 class ReceiptFuzz(TestCase):
     """Random shuffle/drop fuzz, 2000 iterations with a fixed seed."""
 
