@@ -1,8 +1,22 @@
 import threading
+from dataclasses import dataclass
+from uuid import uuid4
 
 from vllm.logger import logger
 
+from vllm_ascend.distributed.kv_transfer.utils.allocation_lifetime import AllocationLifetime, AllocationPin
+
 _WILDCARD_LOCATION = "*"
+
+
+@dataclass(frozen=True)
+class RegistrationSnapshot:
+    engine_instance: str
+    generation: int
+    regions: tuple[tuple[int, int, str], ...]
+
+    def __getstate__(self):
+        raise TypeError("Local TE addresses must not enter target wire metadata")
 
 
 class GlobalTE:
@@ -12,6 +26,10 @@ class GlobalTE:
         self.transfer_engine_lock = threading.Lock()
         self.register_buffer_lock = threading.Lock()
         self._registered_regions: list[tuple[int, int, str]] = []
+        self._registration_instance = uuid4().hex
+        self._registration_generation = 0
+        self._registration_complete = False
+        self._target_lifetime = AllocationLifetime("Mooncake TE registration")
 
     def get_transfer_engine(self, hostname: str, device_name: str | None):
         if self.transfer_engine is None:
@@ -70,6 +88,7 @@ class GlobalTE:
             if self.is_register_buffer:
                 return
 
+            self._registration_complete = False
             registered_regions: list[tuple[int, int, str]] = []
             try:
                 for ptr, size, location in regions:
@@ -107,22 +126,48 @@ class GlobalTE:
                         "for regions: " + "; ".join(failure_messages)
                     ) from exc
                 raise
-            self._registered_regions = regions
+            self._registered_regions = registered_regions
             self.is_register_buffer = True
+            self._registration_generation += 1
+            self._registration_complete = True
+            self._target_lifetime = AllocationLifetime("Mooncake TE registration")
+
+    def registration_snapshot(self) -> RegistrationSnapshot:
+        """Describe only a completely successful, still-live registration."""
+        with self.register_buffer_lock:
+            if not self._registration_complete or not self.is_register_buffer or not self._registered_regions:
+                raise RuntimeError("Target catalog requires a complete live TE registration")
+            return RegistrationSnapshot(
+                self._registration_instance, self._registration_generation, tuple(self._registered_regions)
+            )
+
+    def retain_registration(self, snapshot: RegistrationSnapshot) -> AllocationPin:
+        with self.register_buffer_lock:
+            current = RegistrationSnapshot(
+                self._registration_instance, self._registration_generation, tuple(self._registered_regions)
+            )
+            if not self._registration_complete or current != snapshot:
+                raise RuntimeError("Target registration changed or is no longer live")
+            return self._target_lifetime.retain()
 
     def unregister_buffer(self) -> None:
-        """Unregister all buffers owned by this wrapper, if any."""
+        """Unregister only after all local target owners release their pins."""
         with self.register_buffer_lock:
             if not self._registered_regions:
                 self.is_register_buffer = False
+                self._registration_complete = False
                 return
             assert self.transfer_engine is not None, "Transfer engine must be initialized"
 
-            failed_regions, failure_messages = self._unregister_regions(self._registered_regions)
-            self._registered_regions = failed_regions
-            self.is_register_buffer = bool(failed_regions)
-            if failure_messages:
-                raise RuntimeError("Mooncake memory unregistration failed for regions: " + "; ".join(failure_messages))
+            def destroy() -> None:
+                failed_regions, messages = self._unregister_regions(self._registered_regions)
+                self._registered_regions = failed_regions
+                self.is_register_buffer = bool(failed_regions)
+                self._registration_complete = False
+                if messages:
+                    raise RuntimeError("Mooncake memory unregistration failed for regions: " + "; ".join(messages))
+
+            self._target_lifetime.close(destroy)
 
 
 global_te = GlobalTE()

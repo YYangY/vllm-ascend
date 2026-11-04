@@ -133,9 +133,18 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         providers = []
         for connector in self._connectors:
             worker = getattr(connector, "connector_worker", None)
+            candidates = [connector, worker]
             for candidate in (connector, worker):
+                if candidate is not None:
+                    # A stable facade can be exposed before its owner catalog
+                    # is registered. Do not serialize/duplicate the owner.
+                    exposed = getattr(candidate, "__dict__", {}).get("target_provider")
+                    if exposed is not None:
+                        candidates.append(exposed)
+            for candidate in candidates:
                 if candidate is not None and callable(getattr(candidate, "acquire_target", None)):
-                    providers.append(candidate)
+                    if all(candidate is not existing for existing in providers):
+                        providers.append(candidate)
         if len(providers) > 1:
             raise ValueError(f"Expected at most one TargetProvider, found {len(providers)}")
         if not providers:

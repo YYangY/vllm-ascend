@@ -1036,6 +1036,46 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_scheduler = None
             self.connector_worker = MooncakeLayerwiseConnectorWorker(vllm_config, kv_cache_config, str(self.engine_id))
 
+        self.target_provider = None
+        self._target_owner_binding = None
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        requested = extra.get("layerwise_receipt_mode", False)
+        if type(requested) is not bool:
+            raise ContractError("layerwise_receipt_mode must be a boolean")
+        if requested and vllm_config.kv_transfer_config.is_kv_consumer:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_owner import (
+                DeferredTargetProvider,
+                TargetProviderClient,
+            )
+
+            if role == KVConnectorRole.SCHEDULER:
+                self.target_provider = TargetProviderClient()
+            else:
+                self.target_provider = DeferredTargetProvider()
+                self.connector_worker.target_provider = self.target_provider
+
+    def configure_target_owner(self, manager, *, retention, consumption_stream, timeout: float, te=None) -> None:
+        """A2 worker-local initialization, before register_kv_caches.
+
+        B supplies its real retention client and uses the same TE registration
+        owner as the connector. The actual catalog is constructed AFTER that
+        registration. No caller may serialize these local objects.
+        """
+        if self.connector_worker is None or self.target_provider is None:
+            raise ContractError("Target owner binding is only available on receipt Decode workers")
+        if self._target_owner_binding is not None or self.target_provider.ready:
+            raise ContractError("Target owner initialization cannot be replaced")
+        te = global_te if te is None else te
+        if te.transfer_engine is not self.connector_worker.engine:
+            raise ContractError("Target catalog must use this connector's actual TE registration owner")
+        self._target_owner_binding = (manager, te, retention, consumption_stream, timeout)
+
+    def bind_target_owner_transport(self, transport) -> None:
+        """A2 scheduler facade; B binds its actual worker-owner channel here."""
+        if self.connector_scheduler is None or self.target_provider is None:
+            raise ContractError("Target owner transport is only available on receipt Decode schedulers")
+        self.target_provider.bind_transport(transport)
+
     ############################################################
     # Scheduler Side Methods
     ############################################################
@@ -1086,7 +1126,23 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
+        facade = getattr(self, "target_provider", None)
+        binding = getattr(self, "_target_owner_binding", None)
+        if facade is not None and binding is None:
+            raise ContractError("Configure the real target owner/retention/stream before receipt KV registration")
         self.connector_worker.register_kv_caches(kv_caches)
+        if facade is not None:
+            manager, te, retention, stream, timeout = binding
+            manager.bind_registered_target_owner(
+                kv_caches,
+                te,
+                retention=retention,
+                consumption_stream=stream,
+                timeout=timeout,
+                facade=facade,
+            )
+            if not facade.ready:
+                raise ContractError("Receipt target owner is not ready after KV registration")
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""

@@ -1,5 +1,10 @@
 # P侧共享KV缓冲区与PD传输交接
 
+> 2026-11-04 两分支整理入口：[实现现状与剩余工作](PD_TRANSFER_IMPLEMENTATION_STATUS.md)。
+> 本分支现包含 receipt 基线及 A1/A2 owner 实现，见 [owner 交接](TARGET_OWNER_RUNTIME_HANDOFF.md)。
+> sender、生产 IPC 与完整生命周期仍待接线，详见清单。
+> 下文保留各阶段交接记录，不将历史验证扩大为最新集成树的端到端验收。
+
 本文面向负责 Mooncake layerwise P/D transfer 的开发者，说明已实现的 P 侧源接口、接入顺序和验收边界。
 交接版本为 `47f98315724770372462399d390068cebb7c3c16`，分支 `p-main-buffer-reuse`，日期为 2026-11-03。
 
@@ -304,7 +309,8 @@ provider构造必须传入 `TargetRuntime`，当前只有协议，没有会默�
 
 ### 11.3 当前集成阻塞和范围
 
-- 对方 `_maybe_publish_target()` 当前构造的BlockAllocation未填 `retention_token`。本实现会拒绝；需B接上真实block retention，而不是填写任意字符串通过检查。
+- 首版交接时对方 `_maybe_publish_target()` 未填 `retention_token`；receipt集成树已由 `bc51f47` 补齐字段签发及scheduler记录。
+  该基线现已纳入本分支，A1/A2 已补真实 owner 核验和本地生命周期；生产跨进程查询与取消／抢占的 block 保留仍需 B/J 接线，不能只以非空字段作为完成依据。
 - 契约 `TargetLease` 拒绝同一 `(backing_id, backing_generation)` 出现多个region。
   大Host池可能按TE上限分段注册，本实现会显式拒绝不能表示的catalog；不能伪造多个backing ID掩盖同一物理池。
 - D基线 sparse offload明确要求BF16 Main；当前P独立1M的INT8 Main配置不能直接作为其匹配端。
