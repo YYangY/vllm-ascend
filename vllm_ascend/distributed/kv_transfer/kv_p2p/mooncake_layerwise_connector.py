@@ -1098,6 +1098,7 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
 class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     requires_full_blocks_on_update_after_alloc = True
     supports_layerwise_buffer_reuse = True
+    reuse_source_contract_version = 1
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         super().__init__(vllm_config, role, kv_cache_config)
@@ -1299,6 +1300,39 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_layer_reuse(self, layer_idx: int) -> None:
         assert self.connector_worker is not None
         self.connector_worker.wait_for_layer_reuse(layer_idx)
+
+    # Source consumer v1: the five callbacks are driven by the Store-side
+    # registry. They delegate to the worker's adapter, which maps them onto the
+    # existing slot ledger and send path so no second send path starts.
+    def open_source(self, source) -> None:
+        assert self.connector_worker is not None
+        consumer = getattr(self.connector_worker, "_reuse_source_consumer", None)
+        if consumer is not None:
+            consumer.open_source(source)
+
+    def source_ready(self, source, requests, ready_event) -> None:
+        assert self.connector_worker is not None
+        consumer = getattr(self.connector_worker, "_reuse_source_consumer", None)
+        if consumer is not None:
+            consumer.source_ready(source, requests, ready_event)
+
+    def seal_source(self, source) -> None:
+        assert self.connector_worker is not None
+        consumer = getattr(self.connector_worker, "_reuse_source_consumer", None)
+        if consumer is not None:
+            consumer.seal_source(source)
+
+    def wait_source(self, source) -> None:
+        assert self.connector_worker is not None
+        consumer = getattr(self.connector_worker, "_reuse_source_consumer", None)
+        if consumer is not None:
+            consumer.wait_source(source)
+
+    def abort_source(self, source, error) -> None:
+        assert self.connector_worker is not None
+        consumer = getattr(self.connector_worker, "_reuse_source_consumer", None)
+        if consumer is not None:
+            consumer.abort_source(source, error)
 
     def on_kv_cache_written(self, layer_name: str = "") -> None:
         if not self._is_kv_producer or not self.has_connector_metadata():
@@ -1945,6 +1979,16 @@ class MooncakeLayerwiseConnectorWorker:
         self._no_compute_layers: set[int] = set()
         self._target_provider = None
         self._receipt_send_drops = 0  # receipt messages lost after retries (watchdog backstop)
+        # Source consumer v1 adapter; installed on the producer so the Store
+        # registry can drive source-lifecycle callbacks. It delegates to this
+        # worker's slot ledger and send path, never starting a second send.
+        self._reuse_source_consumer: Any = None
+        if self.vllm_config.kv_transfer_config.is_kv_producer:
+            from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_source_consumer import (
+                LayerwiseSourceConsumer,
+            )
+
+            self._reuse_source_consumer = LayerwiseSourceConsumer(self)
 
         self.block_size: list[int] = [spec.block_size for spec in self.kv_cache_specs]
         self.kernel_block_size_scale: list[int] = [1 for _ in range(self.num_kv_cache_groups)]
