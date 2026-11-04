@@ -6,6 +6,7 @@ slot reuse wait. These tests cover the lifecycle state machine and delegation
 without torch or an NPU, using a stub worker that records wait calls.
 """
 
+import queue
 import unittest
 from types import SimpleNamespace
 
@@ -26,11 +27,13 @@ def _source(layer: int = 0) -> LayerSource:
 
 
 class StubWorker:
-    """Records wait_for_layer_reuse and _complete_layer_reuse calls."""
+    """Records wait_for_layer_reuse and _complete_layer_reuse; owns a queue."""
 
     def __init__(self):
         self.waits = []
         self.completions = []
+        self.send_queue: queue.Queue = queue.Queue()
+        self.kv_send_layer_thread = SimpleNamespace(send_queue=self.send_queue)
 
     def wait_for_layer_reuse(self, layer_idx: int) -> None:
         self.waits.append(layer_idx)
@@ -93,6 +96,43 @@ class TestLayerwiseSourceConsumer(unittest.TestCase):
         consumer = LayerwiseSourceConsumer(worker)
         with self.assertRaisesRegex(RuntimeError, "source_ready before open_source"):
             consumer.source_ready(_source(0), (), ready_event=None)
+
+    def test_hand_off_after_source_ready_releases_immediately(self):
+        # source_ready fires first; save_kv_layer hands off afterwards. The task
+        # is released right away with the KV-ready fence attached.
+        worker = StubWorker()
+        consumer = LayerwiseSourceConsumer(worker)
+        source = _source(4)
+        consumer.open_source(source)
+        ready = SimpleNamespace(name="ready-event")
+        consumer.source_ready(source, (), ready_event=ready)
+        task = SimpleNamespace(wait_event=None)
+        consumer.hand_off_send_task(4, task)
+        self.assertIs(worker.send_queue.get_nowait(), task)
+        self.assertIs(task.wait_event, ready)
+
+    def test_hand_off_before_source_ready_holds_then_releases(self):
+        # save_kv_layer hands off first; source_ready releases it. The task is
+        # not enqueued until source_ready fires (readers registered first).
+        worker = StubWorker()
+        consumer = LayerwiseSourceConsumer(worker)
+        source = _source(6)
+        consumer.open_source(source)
+        task = SimpleNamespace(wait_event=None)
+        consumer.hand_off_send_task(6, task)
+        self.assertTrue(worker.send_queue.empty())
+        ready = SimpleNamespace(name="ready-event")
+        consumer.source_ready(source, (), ready_event=ready)
+        self.assertIs(worker.send_queue.get_nowait(), task)
+        self.assertIs(task.wait_event, ready)
+
+    def test_hand_off_without_open_generation_falls_back_to_direct_enqueue(self):
+        # No open_source for the layer: the consumer must not swallow the task.
+        worker = StubWorker()
+        consumer = LayerwiseSourceConsumer(worker)
+        task = SimpleNamespace(wait_event=None)
+        consumer.hand_off_send_task(9, task)
+        self.assertIs(worker.send_queue.get_nowait(), task)
 
 
 if __name__ == "__main__":

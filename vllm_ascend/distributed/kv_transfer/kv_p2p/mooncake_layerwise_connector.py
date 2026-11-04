@@ -2970,7 +2970,17 @@ class MooncakeLayerwiseConnectorWorker:
                 # and start H2D before this transfer is registered as pending.
                 self._mark_layer_reuse_pending(self.current_layer)
             try:
-                self.kv_send_layer_thread.send_queue.put(layer_send_task)
+                # When the source contract is active, hand the assembled task to
+                # the consumer so it is released through source_ready (readers
+                # registered before the async send runs). Plain mode, or a layer
+                # the registry did not open, enqueues directly, preserving the
+                # legacy path. hand_off_send_task itself falls back to a direct
+                # enqueue when no open generation exists for the layer.
+                consumer = getattr(self, "_reuse_source_consumer", None)
+                if consumer is not None:
+                    consumer.hand_off_send_task(self.current_layer, layer_send_task)
+                else:
+                    self.kv_send_layer_thread.send_queue.put(layer_send_task)
             except Exception as error:
                 if needs_reuse_gate:
                     self._complete_layer_reuse(self.current_layer, str(error))
