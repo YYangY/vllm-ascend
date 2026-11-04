@@ -1141,20 +1141,40 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         B supplies its real retention client and uses the same TE registration
         owner as the connector. The actual catalog is constructed AFTER that
         registration. No caller may serialize these local objects.
+
+        In a co-located deployment (scheduler and decode worker in one process)
+        the caller may omit ``retention``: the scheduler retention registry is
+        then consumed from the module-level rendezvous channel shared by the
+        scheduler role. A multi-process deployment must pass a real wire
+        retention client; no authority is guessed or fabricated.
         """
         if self.connector_worker is None or self.target_provider is None:
             raise ContractError("Target owner binding is only available on receipt Decode workers")
         if self._target_owner_binding is not None or self.target_provider.ready:
             raise ContractError("Target owner initialization cannot be replaced")
+        if retention is None:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
+
+            retention = target_owner_channel.scheduler_retention_authority()
         te = global_te if te is None else te
         if te.transfer_engine is not self.connector_worker.engine:
             raise ContractError("Target catalog must use this connector's actual TE registration owner")
         self._target_owner_binding = (manager, te, retention, consumption_stream, timeout)
 
-    def bind_target_owner_transport(self, transport) -> None:
-        """A2 scheduler facade; B binds its actual worker-owner channel here."""
+    def bind_target_owner_transport(self, transport=None) -> None:
+        """A2 scheduler facade; B binds its actual worker-owner channel here.
+
+        In a co-located deployment the caller may omit ``transport``: a local
+        dispatcher-backed transport is built from the module-level rendezvous
+        channel shared by the worker role. A multi-process deployment must pass
+        a real wire transport; no transport is guessed silently.
+        """
         if self.connector_scheduler is None or self.target_provider is None:
             raise ContractError("Target owner transport is only available on receipt Decode schedulers")
+        if transport is None:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
+
+            transport = target_owner_channel.LocalOwnerTransport()
         self.target_provider.bind_transport(transport)
 
     ############################################################
@@ -1239,6 +1259,13 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if not facade.ready:
                 raise ContractError("Receipt target owner is not ready after KV registration")
+            # Co-located deployment: publish the bound owner dispatcher through
+            # the module-level rendezvous so the scheduler's TargetProviderClient
+            # can reach it. A multi-process deployment wires a real wire transport
+            # through bind_target_owner_transport instead.
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
+
+            target_owner_channel.bind_worker_dispatcher(facade)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
@@ -1570,6 +1597,13 @@ class MooncakeLayerwiseConnectorScheduler:
         )
 
         self._retention_registry = SchedulerRetentionRegistry(kv_cache_manager)
+        # Co-located deployment: share the registry by reference through the
+        # module-level rendezvous so the decode worker's owner runtime can nest
+        # retain() calls on the calling thread. A multi-process deployment
+        # wires a real wire retention client through configure_target_owner.
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
+
+        target_owner_channel.bind_scheduler_retention_authority(self._retention_registry)
 
     def _maybe_publish_target(self, request: "Request", kv_transfer_params: dict, local_block_ids) -> None:
         """Acquire the D-side target right after allocation and
