@@ -111,6 +111,20 @@ if TYPE_CHECKING:
 
 DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
+
+
+def _multiprocessing_enabled() -> bool:
+    """Whether the V1 scheduler runs the decode worker in a separate process.
+
+    The receipt target owner channel has two transports: a co-located one that
+    shares the scheduler retention registry by reference, and a wire one for
+    multi-process deployments. When multiprocessing is on, the co-located
+    channel cannot cross the boundary, so omitting the transport/retention
+    argument fails closed instead of silently falling back to it.
+    """
+    return os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "0") == "1"
+
+
 # Layerwise receipt protocol positional arrays decoded by
 # msgspec.Decoder(type=tuple), contract version at index 1. P emits one
 # LAYER_RESULT per (layer, component, chunk span) plus one RANK_TERMINAL per
@@ -1141,6 +1155,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.target_provider = None
         self._target_owner_binding = None
+        self._target_owner_dispatcher = None
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         requested = extra.get("layerwise_receipt_mode", False)
         if type(requested) is not bool:
@@ -1175,6 +1190,11 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         if self._target_owner_binding is not None or self.target_provider.ready:
             raise ContractError("Target owner initialization cannot be replaced")
         if retention is None:
+            if _multiprocessing_enabled():
+                raise ContractError(
+                    "Multi-process deployment must supply a real wire retention authority; "
+                    "the co-located channel does not cross a process boundary"
+                )
             from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
 
             retention = target_owner_channel.scheduler_retention_authority()
@@ -1194,6 +1214,11 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_scheduler is None or self.target_provider is None:
             raise ContractError("Target owner transport is only available on receipt Decode schedulers")
         if transport is None:
+            if _multiprocessing_enabled():
+                raise ContractError(
+                    "Multi-process deployment must supply a real wire owner transport; "
+                    "the co-located channel does not cross a process boundary"
+                )
             from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
 
             transport = target_owner_channel.LocalOwnerTransport()
@@ -1284,10 +1309,12 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             # Co-located deployment: publish the bound owner dispatcher through
             # the module-level rendezvous so the scheduler's TargetProviderClient
             # can reach it. A multi-process deployment wires a real wire transport
-            # through bind_target_owner_transport instead.
+            # through bind_target_owner_transport instead; in that mode the
+            # dispatcher is still cached here so the worker-side wire server loop
+            # can reach it without the module channel.
             from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import target_owner_channel
 
-            target_owner_channel.bind_worker_dispatcher(facade)
+            self._target_owner_dispatcher = target_owner_channel.bind_worker_dispatcher(facade)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
