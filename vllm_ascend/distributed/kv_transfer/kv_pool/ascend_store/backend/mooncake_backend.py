@@ -434,6 +434,15 @@ class MooncakeBackend(Backend):
             raise RuntimeError("Mooncake client does not support batch_get_session_end")
         return int(method(keys))
 
+    def remove_private_snapshots(self, keys: list[str]) -> list[int]:
+        """Remove only owned private objects, respecting all active leases."""
+        if any(not any(marker in key for marker in ("@private_snapshot_v1:", "@private_full_v1:")) for key in keys):
+            raise ValueError("Private snapshot cleanup must not remove public block keys")
+        self.ensure_initialized()
+        if self.store is None or not callable(getattr(self.store, "remove", None)):
+            raise RuntimeError("Mooncake client does not provide private snapshot cleanup")
+        return [int(self.store.remove(key, False)) for key in keys]
+
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         self.ensure_initialized()
         assert self.store is not None
