@@ -187,6 +187,14 @@ class ReqMeta:
     local_computed_tokens: int = 0
     local_transed_tokens: int = 0
     do_virtual: bool = False
+    # Receipt-mode restore-only: the D scheduler marks a request whose entire
+    # prompt is covered by the target lease writer plan, so the D worker must
+    # restore from the Store instead of running a normal model forward. The
+    # token range is the full prompt (restore_end_token == token_len_chunk),
+    # satisfying the Store restore driver's no-new-tokens contract.
+    restore_only: bool = False
+    restore_end_token: int = 0
+    token_len_chunk: int = 0
     # Receipt mode generated once by the D scheduler in
     # update_state_after_alloc and carried to P via
     # kv_transfer_params. Empty for plain-mode requests.
@@ -1126,6 +1134,9 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
             local_computed_tokens=local_computed_tokens,
             prompt_len=prompt_len,
             local_transed_tokens=local_transed_tokens,
+            restore_only=bool(kv_transfer_params.get("restore_only", False)),
+            restore_end_token=int(kv_transfer_params.get("restore_end_token", 0)),
+            token_len_chunk=int(kv_transfer_params.get("token_len_chunk", 0)),
             trans_count=[],
         )
 
@@ -1768,8 +1779,18 @@ class MooncakeLayerwiseConnectorScheduler:
         if lease.regions:
             kv_transfer_params["remote_te_rpc_endpoint"] = lease.regions[0].transport_endpoint
         kv_transfer_params["remote_writer_plan"] = lease.writer_plan
+        # The writer-plan coverage check above guarantees the full prompt is
+        # covered by the lease, so the D worker can restore the entire range
+        # from the Store without a model forward. Mark restore-only so the
+        # multi-connector routes this request to the Store restore driver
+        # instead of normal attention computation; the full-range token
+        # bounds satisfy the driver's no-new-tokens contract.
+        prompt_len = allocation.prompt_tokens
+        kv_transfer_params["restore_only"] = True
+        kv_transfer_params["restore_end_token"] = prompt_len
+        kv_transfer_params["token_len_chunk"] = prompt_len
         logger.info(
-            "Published target for req %s (instance=%s, backings=%s, expected_senders=%d)",
+            "Published target for req %s (instance=%s, backings=%s, expected_senders=%d, restore_only=True)",
             external_req_id,
             request_instance,
             backings,
