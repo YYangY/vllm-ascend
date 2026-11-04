@@ -218,6 +218,10 @@ class RegisteredRegion:
     backing_offset_bytes: int
     length_bytes: int
     memory_kind: str
+    # "host:rpc_port" the producer opens a mooncake session to. Per-engine,
+    # shared by every region of one lease; the producer uses it instead of a
+    # separate zmq handshake to reach the target's TransferEngine.
+    transport_endpoint: str = ""
 
     def __post_init__(self) -> None:
         _require_str("RegisteredRegion.engine_instance", self.engine_instance)
@@ -231,6 +235,7 @@ class RegisteredRegion:
             raise ContractError(
                 f"RegisteredRegion.memory_kind must be one of {_MEMORY_KINDS}, got {self.memory_kind!r}"
             )
+        _require_str("RegisteredRegion.transport_endpoint", self.transport_endpoint)
 
 
 @dataclass(frozen=True)

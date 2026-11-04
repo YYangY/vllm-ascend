@@ -225,6 +225,7 @@ class RegisteredTargetResources:
                 address - backing[2],
                 size,
                 "host" if component is Component.MAIN else "device",
+                self._snapshot.transport_endpoint,
             )
             if identity in regions and regions[identity] != candidate:
                 raise ContractError("TE region ambiguously mixes target backing identities")

@@ -153,6 +153,14 @@ class ReqMeta:
     remote_host: str | None
     remote_port: int | None
     remote_te_rpc_port: int | None
+    # "host:rpc_port" carried by the target lease (RegisteredRegion.transport_endpoint).
+    # When present, the producer opens a mooncake session to it directly instead
+    # of querying the decoder's te_rpc_port over a zmq handshake.
+    remote_te_rpc_endpoint: str | None = None
+    # Writer plan carried by the target lease. When present, the producer
+    # applies it: a Main backing is written by its single assigned rank only,
+    # avoiding duplicate sends; Indexer ranges go to every consuming rank.
+    remote_writer_plan: Any = None
     remote_layer_metadata: dict[str, LayerMetadata] | None
     metaserver: str | None
     remote_tp_size: int | None
@@ -641,7 +649,18 @@ class KVCacheSendingLayerThread(threading.Thread):
         layer_names = send_task.layer_names or [send_task.layer_name]
         layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
         for req_id, req_meta in send_task.send_request.items():
-            session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
+            # Prefer the target lease's transport endpoint (carried by the
+            # receipt lease's RegisteredRegion); fall back to the zmq-handshake
+            # host:port for plain mode or a lease that did not carry it.
+            session_id = req_meta.remote_te_rpc_endpoint or (
+                f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
+                if req_meta.remote_host and req_meta.remote_te_rpc_port is not None
+                else None
+            )
+            if session_id is None:
+                raise RuntimeError(
+                    f"Cannot open a mooncake session for {req_id}: no target endpoint and no handshake port"
+                )
             if session_id not in session_meta:
                 session_meta[session_id] = TransferMeta(src=[], dst=[], length=[], req_ids=[])
 
@@ -1080,6 +1099,8 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
             remote_host=kv_transfer_params.get("remote_host"),
             remote_port=kv_transfer_params.get("remote_port"),
             remote_te_rpc_port=kv_transfer_params.get("remote_te_rpc_port"),
+            remote_te_rpc_endpoint=kv_transfer_params.get("remote_te_rpc_endpoint"),
+            remote_writer_plan=kv_transfer_params.get("remote_writer_plan"),
             remote_layer_metadata=kv_transfer_params.get("remote_layer_metadata"),
             metaserver=kv_transfer_params.get("metaserver"),
             remote_tp_size=kv_transfer_params.get("remote_tp_size"),
@@ -1713,6 +1734,13 @@ class MooncakeLayerwiseConnectorScheduler:
         )
         self._pending_receipt_specs[request_instance] = spec
         self._request_leases[request_instance] = lease
+        # Carry the target's mooncake transport endpoint and writer plan to the
+        # producer so it can open a session without a separate zmq handshake
+        # and apply the lease's Main-writer / Indexer-per-rank分工. Per-engine,
+        # shared by every region of the lease.
+        if lease.regions:
+            kv_transfer_params["remote_te_rpc_endpoint"] = lease.regions[0].transport_endpoint
+        kv_transfer_params["remote_writer_plan"] = lease.writer_plan
         logger.info(
             "Published target for req %s (instance=%s, backings=%s, expected_senders=%d)",
             external_req_id,
@@ -2926,6 +2954,19 @@ class MooncakeLayerwiseConnectorWorker:
             for req_id, req_meta in connector_metadata.requests.items():
                 if len(req_meta.local_block_ids) <= layer_group_idx or not req_meta.local_block_ids[layer_group_idx]:
                     continue
+                # Apply the lease writer plan: a Main backing has exactly one
+                # writer rank; other ranks skip it to avoid duplicate sends.
+                # Indexer ranges go to every consuming rank. v1 single-backing:
+                # the plan's writers_by_backing has one Main entry.
+                writer_plan = getattr(req_meta, "remote_writer_plan", None)
+                if writer_plan is not None and isinstance(
+                    self.kv_cache_specs[layer_group_idx], (FullAttentionSpec, SlidingWindowSpec)
+                ):
+                    main_writers = tuple(
+                        ranks for backing, ranks in writer_plan.writers_by_backing.items() if ranks and len(ranks) == 1
+                    )
+                    if main_writers and self.tp_rank not in main_writers[0]:
+                        continue
                 try:
                     req_meta_update = self.update_decoder_info(req_id, req_meta)
                 except Exception as e:
