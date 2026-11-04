@@ -1492,11 +1492,26 @@ class MooncakeLayerwiseConnectorScheduler:
         self._target_provider = provider
         self._pending_receipt_specs: dict[str, tuple] = {}
         self._request_leases: dict[str, Any] = {}
-        # Scheduler-issued block retention records, keyed by request_instance.
-        # The token rides inside lease.allocation to the worker; the target
-        # runtime validates liveness against this record, and a successful
-        # release_target confirmation closes it (release failure keeps it).
-        self._retention_tokens: dict[str, str] = {}
+        # Scheduler-owned retention authority, bound via
+        # bind_scheduler_retention() by the deployment's scheduler wrapper.
+        # Receipt-mode admission fails closed until it is bound: a non-empty
+        # retention token must come from a registry that verifies the live
+        # scheduler allocation, never from a fabricated string.
+        self._retention_registry = None
+
+    def bind_scheduler_retention(self, kv_cache_manager) -> None:
+        """Bind the scheduler's real KVCacheManager as the retention authority.
+
+        The scheduler wrapper calls this once at init, before any receipt
+        request is admitted. Receipt-mode admission fails closed until the
+        authority is bound: a non-empty retention token must come from a
+        registry that verifies the live scheduler allocation.
+        """
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.target_retention import (
+            SchedulerRetentionRegistry,
+        )
+
+        self._retention_registry = SchedulerRetentionRegistry(kv_cache_manager)
 
     def _maybe_publish_target(self, request: "Request", kv_transfer_params: dict, local_block_ids) -> None:
         """Acquire the D-side target right after allocation and
@@ -1511,20 +1526,25 @@ class MooncakeLayerwiseConnectorScheduler:
         request_instance = kv_transfer_params.get("request_instance", "")
         external_req_id = kv_transfer_params.get("request_id", "")
         request_key = RequestKey(request_instance=request_instance, transfer_generation=0)
-        # Block retention record: the scheduler owns the allocated blocks until
-        # the release confirmation; the token identifies this record inside the
-        # lease so the target runtime can validate it (the contract requires a
-        # non-empty token and rejects acquisition without one).
-        retention_token = uuid.uuid4().hex
-        self._retention_tokens[request_instance] = retention_token
+        # Block retention: the scheduler-owned registry verifies the live
+        # allocation and issues the authoritative token (the contract requires
+        # a non-empty token and rejects acquisition without one). Admission is
+        # fail-closed: receipt mode without a bound authority never publishes.
+        registry = self._retention_registry
+        if registry is None:
+            logger.error(
+                "Receipt request %s: scheduler retention authority is not bound; refusing to publish",
+                request.request_id,
+            )
+            return False
         allocation = BlockAllocation(
             request=request_key,
             allocation_generation=0,
             group_block_ids=tuple(tuple(group) for group in local_block_ids) or ((0,),),
             manager_block_size_tokens=min(self.block_size),
             prompt_tokens=max(len(request.prompt_token_ids), 1),
-            retention_token=retention_token,
         )
+        allocation = registry.issue(request.request_id, allocation)
         lease = provider.acquire_target(request_key, allocation)
         assert_lease_consistent(lease, request_key)
         # Startup-check leftovers that depend on the lease contents:
@@ -1728,7 +1748,9 @@ class MooncakeLayerwiseConnectorScheduler:
             )
             return False
         leases.pop(instance, None)
-        self._retention_tokens.pop(instance, None)
+        # The scheduler retention record is retired through the ReleaseAck
+        # aggregation path (registry.retire), not here: local release alone
+        # never authorizes returning blocks to the free pool.
         logger.info("Released target for %s (instance=%s)", request.request_id, instance)
         return True
 

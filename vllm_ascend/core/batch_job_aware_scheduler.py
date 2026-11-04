@@ -640,6 +640,14 @@ class BatchJobAwareScheduler(Scheduler):
             self, self._job_decode_estimator, self._block_reserver, self._job_name_parser, _config
         )
 
+        # Connector-side scheduler retention authority (receipt mode): the
+        # registry verifies live allocations and issues retention tokens; the
+        # connector refuses receipt admission until this is bound.
+        connector = getattr(self, "kv_connector", None)
+        bind = getattr(connector, "bind_scheduler_retention", None)
+        if callable(bind):
+            bind(self.kv_cache_manager)
+
     def schedule(self, *args, **kwargs):
         """Override to invalidate the block-reserve cache before each step.
 

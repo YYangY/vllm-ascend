@@ -101,8 +101,9 @@ TargetLease 经 connector metadata 随调度跨进程序列化，必须为纯数
 4. 远端写入完成 / Host 可见性证据由 connector 侧提供：已备 API 语义记录（`batch_transfer_sync_write` 忙等轮询至 COMPLETED；源读取结束已证；远端可见 ⚠️ 待首机"写完立刻读"实证；备选 notify 路径 `batchTransferAsync` + `submitTransferWithNotify`）；
 5. D receipt 放行 / 取消 / 写回回收路径；
 6. 首次联调配置：BF16 Main，双方同布局同精度（不引入量化转换）。
+7. scheduler 侧 retention 绑定：部署的 scheduler wrapper 启动时调用一次 `bind_scheduler_retention(kv_cache_manager)`，装配 target 侧的 `SchedulerRetentionRegistry`（`sparse_kv_offload/target_retention.py`）。batch-aware wrapper 已内建（`BatchJobAwareScheduler.__init__` 为参考实现）；其他 scheduler 需一行挂点。未绑定 authority 时 receipt 准入 fail-closed（拒绝发布），不退回伪造 token。
 
-已闭合：`BlockAllocation.retention_token` 空缺（`bc51f47`）：调度侧按请求签发 retention 记录，token 随 `lease.allocation` 下发，`release_target` 确认成功后闭合、失败保留。
+已闭合（升级）：`BlockAllocation.retention_token` 的签发走 scheduler 权威路径——`registry.issue()` 核对活动分配后写入 token，随 `lease.allocation` 下发；`registry.retire(allocation, ack)` 的调用点位于 ReleaseAck 汇总路径（§6-5），本侧 `release_target` 不直接归还 blocks。
 
 ## 7. 部署
 
