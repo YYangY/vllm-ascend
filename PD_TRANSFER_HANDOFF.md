@@ -257,3 +257,66 @@ sender首先避免不必要的全前缀重传、小批调用和额外全设备�
 
 接口名称可在共同评审后调整；调整必须同步调用方、适配器和契约测试。
 本文没有授权推送、合并或切换集群服务。
+
+## 11. TargetProvider首版 2026年11月4日
+
+本节记录交接提交之后的TargetProvider第一阶段实现。本轮没有修改集群；实现范围与尚未完成的runtime接线见下文。
+
+### 11.1 已实现
+
+- [target_provider.py](vllm_ascend/distributed/kv_transfer/sparse_kv_offload/target_provider.py) 提供 `RegisteredTargetProvider` 四方法和三个属性。
+- `provider_from_registered_dsa_layouts()` 消费已有 `(Indexer layouts, Main layouts)`、已注册 region、本进程 base address、显式 layer/group 映射。
+  它只描述既有分配，不申请 tensor、Host pool 或第二套请求 blocks；local base address 不进入可序列化 lease。
+- 注册范围、物理 page footprint／stride、完整 prompt 容量、Main Host／Indexer device、BF16 Main、模型要求的层覆盖和 writer plan 均有校验。
+- `acquire_target` 要求匹配 request identity 和非空 scheduler retention token；同一身份的完全相同申请幂等，活动 blocks 不交给另一租约。
+- `prepare_decode` 验证 receipt 的请求、目标分配代次及三项完整性，再调用 runtime 可见性操作；本类不自行设置 `visible=True`。
+- `release_target` 仅在 runtime 同步释放成功后解除本地 block 占用；失败保留占用并允许安全重试。
+- runtime callback 在状态锁外执行；对外数据使用值语义快照，避免可变 writer plan 篡改已注册身份。
+- 成功释放只保留紧凑身份指纹，拒绝旧身份再次申请，迟到重复释放不影响新请求。指纹墓碑的长期回收策略仍需结合安全代次推进制定。
+
+共享契约原样导入自 `YYangY/vllm-ascend` 的固定提交 `46f045aa0acbe7d26903ff364ea13f652ac29d08`：
+
+- [mooncake_layerwise_contract.py](vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_contract.py)
+- SHA256：`af939c9f2d1e7449d8b23315164f500fb75cd024b3439eb41527351f3d4c5a08`
+
+这是对方维护的接口，未修改类型／枚举来适应本地实现，也没有合并她的 sender／MultiConnector 分支。
+
+### 11.2 必须接上的真实runtime
+
+provider构造必须传入 `TargetRuntime`，当前只有协议，没有会默认成功的生产实现：
+
+| 操作 | 必须由真实分配所有者落实 |
+| --- | --- |
+| `retain(lease)` | 核验 scheduler retention 有效并持有已有物理分配；失败必须原子回滚自身部分引用 |
+| `make_visible(lease, receipt)` | 为真实Host／device写入落实可见性，并将依赖接入正确的消费stream |
+| `release(lease)` | 阻止新的旧请求访问，确认计算／写回引用已静止，同步解除自身引用；失败仍保留租约 |
+
+这些操作不能用 `lambda: None` 配置到生产环境。测试使用受控替身只能证明调用和状态机，不能证明NPU可见性。
+目前未自动将 provider 暴露到 AscendStoreConnector，因此导入本模块不会悄悄激活 receipt 模式。
+
+下一步需在D初始化及请求生命周期中建立 owner-side runtime 和 scheduler facade：
+
+1. worker在既有manager与TE完成分配／注册后生成真实catalog；保留实际owner引用、注册代次和backing身份。
+2. scheduler基于自己的BlockAllocation及有效retention申请目标，不能直接访问worker内存对象。
+3. 通过真实进程间通道传播纯数据lease／catalog及安全释放确认；锁、tensor、NPU事件留在各自所有者进程。
+4. `prepare_decode`在正确worker／消费stream落地；远端写入完成／Host可见性证据由传输侧提供，不使用默认完成事件。
+5. 两侧共享相同RequestKey、allocation／registration generation；remote DMA静止和scheduler归还blocks仍由B共同保证。
+
+### 11.3 当前集成阻塞和范围
+
+- 对方 `_maybe_publish_target()` 当前构造的BlockAllocation未填 `retention_token`。本实现会拒绝；需B接上真实block retention，而不是填写任意字符串通过检查。
+- 契约 `TargetLease` 拒绝同一 `(backing_id, backing_generation)` 出现多个region。
+  大Host池可能按TE上限分段注册，本实现会显式拒绝不能表示的catalog；不能伪造多个backing ID掩盖同一物理池。
+- D基线 sparse offload明确要求BF16 Main；当前P独立1M的INT8 Main配置不能直接作为其匹配端。
+  首次共同联调使用双方已核实的相同布局／精度，不自动引入量化转换。
+- 当前四方法已完成本地核心实现，但真实owner runtime、跨进程安装、D receipt放行、取消及写回回收均未验收。
+- 不改变已有P源接口或基线D路径；不要据此开启生产 `layerwise_receipt_mode`。
+
+### 11.4 测试
+
+新增 [test_target_provider.py](tests/ut/distributed/ascend_store/test_target_provider.py)，17项测试。
+连同既有P相关用例，聚焦入口共139项通过，日志在部署工作区
+`artifacts/p-main-buffer-reuse/ut-20261104-110837-974015.log`。
+自身provider／测试的Ruff检查通过；导入契约保留原样，其两个`str, Enum`继承触发当前本地Ruff的UP042建议，未做可能改变共享枚举行为的unsafe fix。
+
+本轮没有运行D模型或真实P/D链路，不能沿用此前P独立1M或受控读者64K结果证明TargetProvider运行时正确。
