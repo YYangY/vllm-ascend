@@ -717,6 +717,31 @@ class PDConsistencyTests(TestCase):
                 producer_main_dtype="bfloat16",
             )
 
+    def test_multiple_writers_per_backing_rejected(self):
+        lease = self._lease()
+        # v1 requires exactly one writer rank per Main backing. Assigning
+        # two ranks models a catalog that did not apply the single-writer rule.
+        plan = C.WriterPlan(
+            writers_by_backing={backing: (0, 1) for backing in lease.writer_plan.writers_by_backing},
+            ranges_by_backing=lease.writer_plan.ranges_by_backing,
+        )
+        bad = C.TargetLease(
+            contract_version=1,
+            request=lease.request,
+            rank=lease.rank,
+            allocation=lease.allocation,
+            regions=lease.regions,
+            views=lease.views,
+            writer_plan=plan,
+        )
+        with self.assertRaisesRegex(ContractError, "one writer rank per Main backing"):
+            C.assert_pd_consistent(
+                bad,
+                producer_tp_size=2,
+                producer_block_sizes=(16,),
+                producer_main_dtype="bfloat16",
+            )
+
     def test_int8_main_rejected(self):
         lease = self._lease()
         # Swap the Main view dtype to INT8 to model an INT8 producer Main

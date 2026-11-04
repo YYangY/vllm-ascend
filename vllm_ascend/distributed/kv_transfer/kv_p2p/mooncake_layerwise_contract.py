@@ -511,6 +511,14 @@ def assert_pd_consistent(
             raise ContractError(
                 f"writer plan assigns ranks {unknown} to backing {backing!r} but producer tp_size={producer_tp_size}"
             )
+        # v1: exactly one writer rank per Main backing. The design selects a
+        # unique writer via destination_ordinal % len(writer_ranks); v1 has a
+        # single Main backing with rank 0 as canonical writer, so multiple
+        # ranks here means the catalog did not apply the v1 single-writer rule.
+        if len(ranks) != 1:
+            raise ContractError(
+                f"v1 requires one writer rank per Main backing; backing {backing!r} has {len(ranks)} writers {ranks}"
+            )
     backing_regions: dict[str, int] = {}
     for region in lease.regions:
         backing_regions[region.backing_id] = backing_regions.get(region.backing_id, 0) + 1
